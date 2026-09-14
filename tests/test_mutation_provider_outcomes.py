@@ -788,26 +788,38 @@ async def test_smtp_transaction_logs_bounded_phase_data(
 
 
 @pytest.mark.parametrize(
-    ("phase", "error", "expected_log"),
+    ("phase", "error", "expected_log", "expected_detail"),
     [
-        ("connect", SMTPResponseException(421, b"private connect detail"), "connect outcome=rejected code=421"),
-        ("connect", ConnectionError("private connect transport"), "connect outcome=error category=connection"),
+        (
+            "connect",
+            SMTPResponseException(421, b"private connect detail"),
+            "connect outcome=rejected code=421",
+            "smtp-connect-rejected",
+        ),
+        (
+            "connect",
+            ConnectionError("private connect transport"),
+            "connect outcome=error category=connection",
+            "smtp-connect-unavailable",
+        ),
         (
             "authenticate",
             SMTPResponseException(535, b"private authentication detail"),
             "authenticate outcome=rejected code=535",
+            "smtp-authenticate-rejected",
         ),
         (
             "authenticate",
             ConnectionError("private authentication transport"),
             "authenticate outcome=error category=connection",
+            "smtp-authenticate-unavailable",
         ),
     ],
     ids=["connect-rejected", "connect-transport", "auth-rejected", "auth-transport"],
 )
 @pytest.mark.asyncio
 async def test_smtp_setup_logs_preserve_phase_without_private_data(
-    email_server, phase: str, error: Exception, expected_log: str
+    email_server, phase: str, error: Exception, expected_log: str, expected_detail: str
 ) -> None:
     client = _private_smtp_client(email_server)
     smtp = _smtp()
@@ -819,13 +831,21 @@ async def test_smtp_setup_logs_preserve_phase_without_private_data(
     with (
         _captured_smtp_logs() as sink,
         patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
-        pytest.raises(type(error)),
     ):
-        await _send_private_message(client)
+        outcome = await _send_private_message(client)
 
     captured = sink.getvalue()
     assert f"SMTP phase={expected_log}" in captured
     _assert_smtp_log_redacted(captured, str(error))
+
+    # No recipient attempt happened (failure was in connect/authenticate), so
+    # every target is reported failed with the same bounded detail that was
+    # logged above — the caller sees this without needing server log access.
+    assert outcome.sent_message is None
+    assert len(outcome.outcomes) == 1
+    assert outcome.outcomes[0].target == _PRIVATE_RECIPIENT
+    assert outcome.outcomes[0].status == "failed"
+    assert outcome.outcomes[0].detail == expected_detail
 
 
 @pytest.mark.asyncio

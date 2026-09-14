@@ -2403,7 +2403,17 @@ class EmailClient:
             )
             if known_outcome is not None:
                 return known_outcome
-            raise
+            # No recipient-level attempt happened yet (connect/authenticate
+            # failed outright). Surface a bounded, non-sensitive detail code
+            # instead of letting the exception escape as an opaque provider
+            # failure — the same rejection category already logged above.
+            return DeliveryMutationOutcome(
+                tuple(
+                    TargetMutationOutcome(target, "failed", f"smtp-{session_phase}-rejected")
+                    for target in all_recipients
+                ),
+                None,
+            )
         except Exception as error:
             logger.warning(
                 "SMTP phase={} outcome=error category={}",
@@ -2414,7 +2424,15 @@ class EmailClient:
             # cannot change SMTP delivery evidence.
             if known_outcome is not None:
                 return known_outcome
-            raise
+            # Same rationale as above: report the bounded category as a
+            # per-target detail rather than raising an opaque failure.
+            return DeliveryMutationOutcome(
+                tuple(
+                    TargetMutationOutcome(target, "failed", f"smtp-{session_phase}-unavailable")
+                    for target in all_recipients
+                ),
+                None,
+            )
         if known_outcome is None:  # pragma: no cover - defensive control-flow invariant
             raise RuntimeError("SMTP transaction completed without an outcome")
         return known_outcome

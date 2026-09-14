@@ -254,8 +254,13 @@ allowed. SMTP delivery reports accepted, rejected, and unknown recipients
 separately when the result is partial or ambiguous. Failed and unknown targets
 include reviewed fixed diagnostics when available, for example
 `smtp-mail-rejected`, `smtp-recipient-rejected`, `smtp-data-rejected`,
-`smtp-data-unknown`, or `provider-timeout`. Unrecognized detail and raw provider
-response text are omitted.
+`smtp-data-unknown`, or `provider-timeout`. A failure before any recipient is
+attempted — the connection or authentication step itself — is reported the
+same way, for every target, as `smtp-connect-rejected`,
+`smtp-connect-unavailable`, `smtp-authenticate-rejected`, or
+`smtp-authenticate-unavailable`; this lets the caller see that the account's
+SMTP credentials or server are rejecting the session without needing server
+log access. Unrecognized detail and raw provider response text are omitted.
 
 Internationalized addr-specs in the envelope or From, Sender, To, Cc, Bcc, or
 Reply-To fields, and non-ASCII Message-ID, In-Reply-To, or References syntax,
