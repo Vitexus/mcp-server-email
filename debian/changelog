@@ -1,8 +1,10 @@
-python-mcp-email-server (1.1.0-2) UNRELEASED; urgency=low
+python-mcp-email-server (1.1.0-3) UNRELEASED; urgency=low
 
   * Rename deb package and launcher binary to mcp-server-email.
+  * Report SMTP connect/authenticate failures via outcome detail instead
+    of an opaque provider_failure.
 
- -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 14 Sep 2026 16:07:27 +0200
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 14 Sep 2026 17:35:14 +0200
 
 python-mcp-email-server (1.1.0-1) UNRELEASED; urgency=low
 
