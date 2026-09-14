@@ -26,7 +26,7 @@
     <category>Email</category>
   </categories>
   <provides>
-    <binary>mcp-email-server</binary>
+    <binary>mcp-server-email</binary>
   </provides>
   <url type="homepage">https://github.com/Wh1isper/mcp-email-server</url>
   <url type="bugtracker">https://github.com/Wh1isper/mcp-email-server/issues</url>

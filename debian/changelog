@@ -1,3 +1,9 @@
+python-mcp-email-server (1.1.0-2) UNRELEASED; urgency=low
+
+  * Rename deb package and launcher binary to mcp-server-email.
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 14 Sep 2026 16:07:27 +0200
+
 python-mcp-email-server (1.1.0-1) UNRELEASED; urgency=low
 
   * Initial Debian packaging

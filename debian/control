@@ -14,7 +14,7 @@ Vcs-Git: https://github.com/Vitexus/python-mcp-email-server.git
 Vcs-Browser: https://github.com/Vitexus/python-mcp-email-server
 Rules-Requires-Root: no
 
-Package: mcp-email-server
+Package: mcp-server-email
 Architecture: all
 Multi-Arch: foreign
 Depends:
@@ -40,4 +40,15 @@ Description: IMAP and SMTP via MCP Server
  MCP-compatible AI clients read, search, organize, and send email over
  IMAP and SMTP. Accounts and credentials are configured via environment
  variables or a local managed store; the server is invoked over stdio
- (mcp-email-server stdio) or as an HTTP/SSE transport.
+ (mcp-server-email stdio) or as an HTTP/SSE transport.
+
+Package: mcprack-mcp-server-email
+Architecture: all
+Depends:
+ ${misc:Depends},
+ mcprack (>= 1.5.1),
+ mcp-server-email (= ${binary:Version}),
+Description: Registers Email MCP server into mcprack catalog
+ Companion package for mcp-server-email. Installing it registers the
+ mcp-server-email binary (stdio transport) as an available MCP server
+ in the local mcprack instance; removing it unregisters it again.
