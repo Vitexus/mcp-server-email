@@ -1,10 +1,14 @@
-python-mcp-email-server (1.1.0-3) UNRELEASED; urgency=low
+python-mcp-email-server (1.1.1-1) unstable; urgency=medium
 
-  * Rename deb package and launcher binary to mcp-server-email.
-  * Report SMTP connect/authenticate failures via outcome detail instead
-    of an opaque provider_failure.
+  * Fix: SMTP failures in the connect/authenticate phase (e.g. rejected
+    credentials) now report a bounded outcome detail such as
+    smtp-authenticate-rejected instead of an opaque provider_failure,
+    so a caller can see why send_email failed without server log access.
+  * Rename the deb package and launcher binary to mcp-server-email, and
+    add an mcprack-mcp-server-email companion package that registers the
+    server into the local mcprack catalog.
 
- -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 14 Sep 2026 17:35:14 +0200
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 14 Sep 2026 22:18:19 +0200
 
 python-mcp-email-server (1.1.0-1) UNRELEASED; urgency=low
 

@@ -6,7 +6,7 @@ export PYBUILD_NAME=mcp_email_server
 	dh $@ --with python3 --buildsystem=pybuild
 
 override_dh_auto_configure:
-	sed -i 's/^version = "0.0.1"/version = "1.1.0"/' pyproject.toml
+	sed -i 's/^version = "0.0.1"/version = "1.1.1"/' pyproject.toml
 	sed -i 's/^mcp-email-server = /mcp-server-email = /' pyproject.toml
 	dh_auto_configure
 
