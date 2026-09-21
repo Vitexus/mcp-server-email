@@ -1,3 +1,13 @@
+mcp-server-email (1.1.2-1) unstable; urgency=medium
+
+  * Align Source name with package: python-mcp-email-server →
+    mcp-server-email.
+  * Provide/Replace/Break mcp-email-server for clean apt upgrade from
+    the previously published binary name.
+  * Update Vcs URLs for the GitHub repo rename to mcp-server-email.
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 21 Sep 2026 16:20:00 +0200
+
 python-mcp-email-server (1.1.1-1) unstable; urgency=medium
 
   * Fix: SMTP failures in the connect/authenticate phase (e.g. rejected
