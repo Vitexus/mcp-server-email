@@ -12,6 +12,7 @@ test('edits recipient and sender allowlists as individual items', async () => {
   vi.mocked(api.policy).mockResolvedValue({
     revision: 4,
     enable_attachment_download: false,
+    enable_attachment_content: false,
     allowed_recipients: ['first@example.test'],
     allowed_senders: ['*@example.test'],
     report_blocked_mutations: false,
@@ -21,11 +22,12 @@ test('edits recipient and sender allowlists as individual items', async () => {
 
   expect(await screen.findByLabelText('Recipient 1')).toHaveValue('first@example.test')
   expect(screen.getByLabelText('Sender pattern 1')).toHaveValue('*@example.test')
+  await user.click(screen.getByRole('checkbox', { name: 'Allow attachments to be returned through MCP' }))
 
   await user.click(screen.getByRole('button', { name: 'Add recipient' }))
   const secondRecipient = screen.getByLabelText('Recipient 2')
   expect(secondRecipient).toHaveFocus()
-  await user.type(secondRecipient, ' second@example.test ')
+  await user.type(secondRecipient, ' *@example.test ')
   await user.click(screen.getByRole('button', { name: 'Remove recipient item 1: first@example.test' }))
 
   await user.click(screen.getByRole('button', { name: 'Add sender pattern' }))
@@ -37,7 +39,8 @@ test('edits recipient and sender allowlists as individual items', async () => {
   await waitFor(() => expect(api.updatePolicy).toHaveBeenCalledWith({
     revision: 4,
     enable_attachment_download: false,
-    allowed_recipients: ['second@example.test'],
+    enable_attachment_content: true,
+    allowed_recipients: ['*@example.test'],
     allowed_senders: ['*@example.test', 'alerts@example.test'],
     report_blocked_mutations: false,
   }, target))
@@ -48,7 +51,8 @@ test('explains the distinct empty-list behavior', async () => {
   const api = createMockApi()
   render(<PolicyPanel api={api} target={target} />)
 
-  expect(await screen.findByText(/Empty means sending is disabled/)).toBeVisible()
+  expect(await screen.findByText(/Empty disables these operations/)).toBeVisible()
+  expect(screen.getByText(/\* allows all recipients for sending, forwarding, and drafts/)).toBeVisible()
   expect(screen.getByText(/Empty means all senders may be read/)).toBeVisible()
   expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
 })

@@ -43,8 +43,8 @@ capability records. Each record contains `account_name`, `account_type`,
 descriptions are limited to 4 KiB of UTF-8 data and expose the same structural
 bound in the output schema. In managed mode, disabled accounts are omitted before any credential lookup or provider
 access. Use only an account with `can_receive=true` for mail reads and
-`can_send=true` for `send_email`. Text content, structured content, and the output
-schema describe the same fields.
+`can_send=true` for `send_email` and `forward_email`. Text content, structured
+content, and the output schema describe the same fields.
 
 If the result is empty, account setup is unavailable over MCP. The agent should
 ask the user to run `mcp-email-server ui` or the documented interactive CLI in
@@ -70,21 +70,21 @@ for client discovery and configuration migration steps.
 Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 `idempotentHint`, and `openWorldHint` values:
 
-| Tools                                                                        | Read-only | Destructive | Idempotent | Open world |
-| ---------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
-| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders` | yes       | no          | yes        | no         |
-| `list_emails_metadata`, `list_mailboxes`                                     | yes       | no          | yes        | yes        |
-| `get_emails_content`                                                         | no        | no          | yes        | yes        |
-| `send_email`, `save_to_mailbox`                                              | no        | no          | no         | yes        |
-| `set_email_flags`, `mark_emails_as_read`                                     | no        | no          | yes        | yes        |
-| `delete_emails`, `move_emails`, `archive_emails`, `download_attachment`      | no        | yes         | no         | yes        |
+| Tools                                                                                           | Read-only | Destructive | Idempotent | Open world |
+| ----------------------------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
+| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders`, `list_email_tags` | yes       | no          | yes        | no         |
+| `list_emails_metadata`, `list_mailboxes`, `get_attachment_content`                              | yes       | no          | yes        | yes        |
+| `get_emails_content`                                                                            | no        | no          | yes        | yes        |
+| `send_email`, `forward_email`, `save_to_mailbox`                                                | no        | no          | no         | yes        |
+| `set_email_flags`, `set_email_tags`, `mark_emails_as_read`                                      | no        | no          | yes        | yes        |
+| `delete_emails`, `move_emails`, `archive_emails`, `download_attachment`                         | no        | yes         | no         | yes        |
 
 `get_emails_content` is conservatively non-read-only because
 `mark_as_read=true` changes remote flags. Download is destructive because the
-caller-selected destination may be replaced. Send and append create externally
-meaningful effects but do not delete or replace an existing mailbox item, so
-their destructive hint is false while their read-only and idempotent hints are
-also false.
+caller-selected destination may be replaced. Send, forward, and append create
+externally meaningful effects but do not delete or replace an existing mailbox
+item, so their destructive hint is false while their read-only and idempotent
+hints are also false.
 
 Annotations are advisory host/agent planning hints, not authorization or a
 safe-retry guarantee. Tool descriptions, current policy, typed outcomes, and the
@@ -104,7 +104,7 @@ Important parameters include:
 | `page`                        | `1`      | One-based result page.                      |
 | `page_size`                   | `10`     | Number of results per page, from 1 to 100.  |
 | `mailbox`                     | `INBOX`  | Mailbox to search.                          |
-| `before` / `since`            | None     | UTC datetime boundaries.                    |
+| `before` / `since`            | None     | Timezone-aware `INTERNALDATE` boundaries.   |
 | `subject`                     | None     | Subject filter.                             |
 | `from_address` / `to_address` | None     | Address filters.                            |
 | `seen`                        | None     | Filter by read status.                      |
@@ -113,11 +113,22 @@ Important parameters include:
 | `body`                        | None     | Search message bodies with IMAP `BODY`.     |
 | `text`                        | None     | Search headers and bodies with IMAP `TEXT`. |
 | `has_attachment`              | None     | Apply a multipart attachment heuristic.     |
+| `semantic_tags`               | None     | Configured semantic tag names.              |
+| `tag_match`                   | `all`    | Require `all` tags or at least `any` tag.   |
 | `order`                       | `desc`   | Return ascending or descending results.     |
 
 The response contains pagination metadata, a filtered `total`, and message
 metadata including `email_id`, `message_id`, subject, sender, recipients, and
-date. To and Cc are parsed as structured RFC 5322 address fields: a comma inside
+date. `since` is inclusive, `before` is exclusive, and both compare the
+provider's IMAP `INTERNALDATE` as an absolute instant. Each value must include a
+UTC offset; values with any valid offset are normalized to UTC. Ordering uses the
+same `INTERNALDATE` value. The returned `date` remains the message's RFC 5322
+`Date` header and can differ from the provider timestamp used for filtering and
+ordering. Every message also returns `provider_keywords`, containing all observed
+non-system IMAP keywords, and `semantic_tags`, containing the configured semantic
+names that map to those keywords. Unknown keywords remain visible in
+`provider_keywords`; standard flags remain
+separate. To and Cc are parsed as structured RFC 5322 address fields: a comma inside
 a quoted display name is preserved, while addresses inside a group are returned
 as individual recipient entries. Because this operation fetches headers only,
 its `attachments` field is empty. `get_emails_content` populates attachment names
@@ -132,14 +143,22 @@ pagination, so `total` and page sizes describe only visible messages.
 The application keeps a rebuildable SQLite projection for unfiltered mailbox
 pages. It uses that projection only after a small IMAP `STATUS` probe confirms
 the same UIDVALIDITY, UIDNEXT, and message count and the projection covers the
-whole mailbox. Text, date, address, flag, body, and attachment filters remain on
-the bounded IMAP path so provider-specific search semantics and mutable flags
-stay authoritative. ASCII filter values retain their exact text through IMAP
+whole mailbox. Before returning a cached page, it fetches current FLAGS only for
+the UIDs on that page so external tag changes are not hidden by the projection.
+Text, date, address, flag, tag, body, and attachment filters remain on the
+bounded IMAP path so provider-specific search semantics and mutable flags stay
+authoritative. Tag filters resolve configured semantic names before IMAP search
+and reject unknown values before provider access. ASCII filter values retain their exact text through IMAP
 atom or quoted-string encoding. Non-ASCII filter values use synchronizing UTF-8
 literals with `CHARSET UTF-8`; a provider that rejects that charset returns a
 bounded search failure rather than receiving malformed raw UTF-8 command text.
-Date criteria always use the protocol's English month tokens regardless of the
-server process locale. A response normally omits `warnings`; if a validated IMAP
+Because base IMAP `BEFORE` and `SINCE` ignore the time and timezone components
+of `INTERNALDATE`, date criteria are conservative candidate filters. The server
+widens them across adjacent calendar dates, fetches complete `INTERNALDATE`
+evidence, and reapplies the exact `[since, before)` interval before calculating
+`total`, ordering, and pagination. Date criteria always use the protocol's
+English month tokens regardless of the server process locale. A response
+normally omits `warnings`; if a validated IMAP
 result was returned but its rebuildable projection could not be persisted, the
 response includes `warnings: ["projection_write_failed"]`. It never includes the
 local exception detail.
@@ -162,6 +181,15 @@ unbounded projection.
 ### `get_emails_content`
 
 Fetches the body of one or more messages by `email_id`.
+
+Each returned message includes the same `provider_keywords` and `semantic_tags`
+fields as `list_emails_metadata`.
+
+### `list_email_tags`
+
+Returns the semantic tag configuration for one account: `name`, `keyword`,
+`description`, and `writable`. Use it to translate natural-language intent into
+a configured tag. An omitted `writable` value is reported as `false`.
 
 | Parameter         | Default  | Description                                                     |
 | ----------------- | -------- | --------------------------------------------------------------- |
@@ -262,14 +290,43 @@ same way, for every target, as `smtp-connect-rejected`,
 SMTP credentials or server are rejecting the session without needing server
 log access. Unrecognized detail and raw provider response text are omitted.
 
+The response names the delivered message's RFC `Message-Id`: a clean send appends
+`Message-Id: <...>` to the success line, and a partial delivery reports the same
+identifier in its own `message-id` section. The server reports it only once the
+provider has accepted the message data, so a rejected, timed-out, or otherwise
+ambiguous delivery names no identifier at all rather than one it cannot vouch
+for. A caller keeping its own record of sent mail can therefore store the
+identifier exactly when the send is proven, and store nothing when it is not.
+The independent Sent copy is not the source of this value; a failed or unknown
+Sent copy does not remove the identifier of a delivered message.
+
 Internationalized addr-specs in the envelope or From, Sender, To, Cc, Bcc, or
 Reply-To fields, and non-ASCII Message-ID, In-Reply-To, or References syntax,
 require the provider's SMTPUTF8 extension. The server requests `SMTPUTF8` and
 serializes the complete message with the matching policy. If the extension is
 unavailable, every target fails with `smtp-utf8-unsupported` before `MAIL FROM`,
-`RCPT TO`, or message data is sent. A non-ASCII display name with an ASCII
-addr-spec is encoded as an ordinary RFC 5322 display name and does not by itself
-require SMTPUTF8.
+`RCPT TO`, or message data is sent. RFC 6531 also requires SMTPUTF8 messages to
+use `BODY=8BITMIME`; if the provider advertises SMTPUTF8 without 8BITMIME, every
+target instead fails with `smtp-8bitmime-required` before `MAIL FROM`. A
+non-ASCII display name with an ASCII addr-spec is encoded as an ordinary RFC
+5322 display name and does not by itself require SMTPUTF8.
+
+The server also classifies the final serialized message body before `MAIL FROM`.
+Outside the SMTPUTF8 case above, a 7-bit-clean body uses ordinary SMTP `DATA`;
+raw high-bit body bytes require the
+provider's `8BITMIME` extension and are sent with `BODY=8BITMIME`. Without that
+extension, every target fails with `smtp-8bitmime-required` before `MAIL FROM`.
+A leaf containing raw high-bit payload bytes under a missing, `7bit`, base64, or
+quoted-printable transfer-encoding label is rejected as
+`smtp-mime-transport-invalid`; `8BITMIME` cannot repair a mismatched MIME label.
+The same failure applies when a composite `multipart` or `message` entity uses a
+forbidden base64/quoted-printable encoding, or labels actual 8-bit child data as
+7-bit. Content that requires binary transport, including a MIME part declaring
+`Content-Transfer-Encoding: binary`, NUL, bare line endings, or an overlong DATA
+line, fails with `smtp-binarymime-unsupported`. The server does not currently
+submit `BINARYMIME` through `CHUNKING`/`BDAT` and does not silently rewrite MIME
+parts to downgrade them. Both transport failures occur before `MAIL FROM`,
+`RCPT TO`, or message data is sent.
 
 Saving the Sent copy is a second IMAP effect and is reported in its own
 `sent-copy` section; a failed or unknown copy never changes an accepted delivery
@@ -284,7 +341,10 @@ as `utf8-append-unsupported` without changing the successful SMTP outcome.
 Composes a message and appends it to an IMAP mailbox instead of sending it. It
 works without SMTP and is useful for drafts or templates. It shares recipient,
 body, attachment, and threading fields with `send_email`, adds `mailbox` and
-`flags`, and does not support `reply_to`.
+`flags`, and does not support `reply_to`. For both compose tools, simple
+Message-IDs in `in_reply_to` and `references` may be supplied with or without
+angle brackets. The server adds missing brackets to each simple whitespace-separated
+ID when constructing the RFC headers and does not double-wrap bracketed IDs.
 
 The default mailbox is `Drafts`. When no explicit flags are supplied, the
 message is saved with `\Draft` and `\Seen`. The response includes the RFC
@@ -310,6 +370,96 @@ SELECT/APPEND with `utf8-append-unsupported`. A known APPEND success without
 `APPENDUID` returns `email_id: unknown`. A lost APPEND result is instead tagged
 `unknown`; the server does not replay it because that could create a duplicate
 draft.
+
+### `forward_email`
+
+Forwards an existing message to new recipients through the selected account's
+SMTP server. The server reads the source message over IMAP, composes a new
+message below an optional note from the caller, and re-attaches the original's
+attachments.
+
+| Parameter             | Default  | Description                                   |
+| --------------------- | -------- | --------------------------------------------- |
+| `account_name`        | Required | Configured account identifier.                |
+| `email_id`            | Required | UID of the source message to forward.         |
+| `recipients`          | Required | Addresses that receive the forwarded message. |
+| `source_mailbox`      | `INBOX`  | Mailbox that contains the source message.     |
+| `body`                | `""`     | Note placed above the forwarded content.      |
+| `cc`                  | None     | Additional CC recipients of the forward.      |
+| `bcc`                 | None     | Additional BCC recipients of the forward.     |
+| `include_attachments` | `true`   | Re-attach the source message's attachments.   |
+
+The subject is derived from the source message as `Fwd: <original subject>`. A
+source subject that already begins with `Fwd:` in any letter case is not
+prefixed a second time.
+
+The forwarded content is appended below the caller's note as a plain-text
+`Forwarded message` block reporting the original's From, Recipients, Date, and
+Subject. That block reports `Recipients:` rather than `To:` because the parsed
+recipient list folds in Cc entries.
+
+The block is re-composed from the parsed plain-text body, so the original's HTML
+formatting is not preserved in the quoted text. The forwarded content is never
+silently truncated: the composed body, including any note you supply, is bounded
+at 1 MiB and an oversized forward is rejected outright. Forward a message when
+the recipient needs its attachments and substance; when byte-exact rendering
+matters, save the parts with `download_attachment` and compose the message
+explicitly with `send_email`.
+
+Attachments carried into the forward keep the source part's MIME main type,
+subtype, and parameters instead of being coerced into `application/*`. Set
+`include_attachments=false` to forward only the text.
+
+Re-attached parts are bounded by the shared application limits: at most 20
+retained parts, 25 MiB per part, and 50 MiB in total. Each size is the
+conservative maximum of the part serialized under the SMTP and SMTPUTF8 wire
+policies, including CRLF expansion. A source with more retained parts than the
+limit is rejected after the read; forward its text with
+`include_attachments=false` instead. Only parts the server classifies as
+attachments are re-attached — an inline part with no filename and no attachment
+disposition (for example a `Content-ID` image referenced by an HTML body) is
+not carried, matching what the metadata and content tools report as
+attachments. The quoting block reports the source's own Date header and omits
+the line entirely when the source has none.
+
+The tool is always present in the stable MCP catalog. The selected
+`account_name` must itself be enabled and send-capable; an IMAP-only account is
+rejected before the source message is read over IMAP and before any SMTP
+access, so a non-send-capable account never downloads or parses the source.
+
+The delivered forward passes through the same
+[SMTP transport classification](#send_email) as any send. A re-attached source
+part correctly labeled with an `8bit` transfer encoding rides `BODY=8BITMIME`
+when the provider advertises it (the composed container is labeled `8bit` to
+keep the message well formed) and fails with `smtp-8bitmime-required` when it
+does not; mislabeled or binary source parts fail with the shared
+`smtp-mime-transport-invalid` and `smtp-binarymime-unsupported` diagnostics
+before `MAIL FROM`.
+
+A forward performs three independent provider effects: the IMAP read of the
+source message, SMTP delivery, and the IMAP Sent copy. Current account authority
+is resolved for each effect. Send capability and recipient policy are checked
+before the source read and again before SMTP; the source sender is also checked
+against the freshly resolved sender policy before SMTP. Sent-copy follows the
+same post-delivery authority rules as `send_email`. If the source message cannot
+be read, the call fails before any SMTP session is opened, so a forward is never
+delivered without the content and attachments it was supposed to carry. Delivery
+and sent-copy outcomes are reported separately under the same rules as
+`send_email`, and an ambiguous SMTP outcome is reported `unknown` and is never
+replayed automatically. The forwarded message's `Message-Id` is reported under
+the same rule: named once the provider accepted the message data, and omitted
+for an ambiguous delivery.
+
+Reading the source message is a mail read. When a sender allowlist is
+configured, a message from a blocked sender is indistinguishable from a missing
+message, so the forward fails without revealing that the message exists. If the
+sender policy is tightened after the source read but before SMTP, the fresh
+policy also aborts delivery with the same not-found-shaped error. The recipient
+allowlist applies to the forward's To, CC, and BCC addresses exactly as it does
+for `send_email`.
+
+For a worked example, see
+[Forward a message with its attachments](guides.md#forward-a-message-with-its-attachments).
 
 ## Mailbox and mutation tools
 
@@ -353,6 +503,15 @@ mark a message unread, remove `\Seen`.
 Marks one or more message IDs as read in the selected mailbox. This focused
 common-workflow tool uses the same implementation as `set_email_flags` with
 `operation="add"` and `flags=["\\Seen"]`.
+
+### `set_email_tags`
+
+Adds or removes one or more configured writable tags. `operation` is `add` or
+`remove`, and `tags` must contain one or more semantic names. Provider keywords
+are not accepted as public input. Each requested tag must exist and have
+`writable=true`; unknown or read-only tags are rejected before provider access.
+The provider performs one UID-scoped `+FLAGS.SILENT` or `-FLAGS.SILENT` effect per
+message. Standard flags and unrelated provider keywords are preserved.
 
 ### `move_emails`
 
@@ -407,6 +566,15 @@ blocked IDs.
 
 ## Attachments
 
+### `get_attachment_content`
+
+Reads one named attachment as an MCP embedded binary resource without writing a
+server-host file. The content-only result carries an opaque `email-attachment://`
+URI, original filename, MIME type, decoded byte size, and one copy of the blob.
+It is independently enabled with `enable_attachment_content=true`; enabling file
+download does not enable MCP content transfer. The complete serialized tool
+result must fit the server's existing global result ceiling.
+
 ### `download_attachment`
 
 Downloads one named attachment from a message to the server host. By default,
@@ -459,8 +627,14 @@ static for the lifetime of a server process. `send_email`,
 `list_allowed_recipients`, `list_allowed_senders`, and `download_attachment` are
 always advertised. Account existence, enabled state, SMTP capability, and
 current policies are enforced when each tool is called. The allowlist tools have
-distinct empty semantics: an empty recipient list disables sending, while an
-empty sender list does not restrict reading. Each list is limited to 1,000
+distinct empty semantics: an empty recipient list denies `send_email`,
+`forward_email`, and `save_to_mailbox`, while an empty sender list does not
+restrict reading. Recipient entries support case-insensitive, whole-address glob
+matching (`*`, `?`, and bracket expressions), such as `*@example.com`.
+`*` or `*@*` explicitly permits all valid recipients for sending, forwarding,
+and draft saves; this is not draft-only permission. Recipient denial errors
+direct users to configure allowed addresses or patterns through the user-operated CLI/UI; this does not require
+sharing credentials with the agent. Each list is limited to 1,000
 entries, and the complete effective-configuration snapshot
 is canonically serialized against the shared 8 MiB ceiling before either policy
 result is returned; oversized authority data fails with `limit_exceeded`.
@@ -478,5 +652,12 @@ To preserve conversation threading:
 3. Build `references` from the returned `references` value followed by the
    original `message_id`, omitting missing values.
 4. Send the reply with a suitable `Re:` subject.
+
+Simple Message-IDs may be bare or already enclosed in angle brackets; the compose
+path emits the required bracketed RFC form for both headers.
+
+`send_email` and `forward_email` name the delivered message's own `Message-Id` in
+their response, so a follow-up in the same thread can be built from it without
+first locating the message again over IMAP.
 
 For a complete example, see [Reply with proper threading](guides.md#reply-with-proper-threading).

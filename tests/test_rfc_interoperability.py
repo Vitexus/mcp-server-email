@@ -20,6 +20,7 @@ from mcp_email_server.emails.classic import (
     _ImapAppendMode,
     _ImapSearchLiteral,
     _message_requires_smtputf8,
+    _normalize_search_uids,
     _parse_list_responses,
     _uid_search,
     _validate_flags,
@@ -177,8 +178,8 @@ def test_imap_dates_use_fixed_english_month_names():
     expected_months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 
     for month, expected in enumerate(expected_months, start=1):
-        value = datetime(2026, month, 1, tzinfo=UTC)
-        assert EmailClient._build_search_criteria(since=value) == ["SINCE", f"01-{expected}-2026"]
+        value = datetime(2026, month, 15, tzinfo=UTC)
+        assert EmailClient._build_search_criteria(since=value) == ["SINCE", f"14-{expected}-2026"]
 
 
 def test_list_response_framing_ignores_completion_and_reassembles_literal():
@@ -244,6 +245,28 @@ def _recording_imap(timeout: float = 1.0, *, fail_write_at: int | None = None):
     imap.protocol = protocol
     imap.timeout = timeout
     return imap, protocol, transport
+
+
+async def _wait_for_transport_writes(transport: _RecordingTransport, count: int = 1) -> None:
+    async with asyncio.timeout(1.0):
+        while len(transport.writes) < count:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_uid_search_treats_icloud_completion_only_response_as_empty():
+    imap, protocol, transport = _recording_imap()
+
+    search_task = asyncio.create_task(_uid_search(imap, ["ALL"]))
+    await _wait_for_transport_writes(transport)
+
+    tag = transport.writes[0].split(maxsplit=1)[0]
+    protocol.data_received(tag + b" OK SEARCH completed (took 2 ms)\r\n")
+    response = await search_task
+
+    assert response.result == "OK"
+    assert response.lines == [b"SEARCH completed (took 2 ms)"]
+    assert _normalize_search_uids(response.lines) == []
 
 
 @pytest.mark.asyncio
@@ -415,6 +438,24 @@ async def test_legacy_send_rejects_message_smtputf8_before_mail_when_unsupported
 
 
 @pytest.mark.asyncio
+async def test_legacy_smtputf8_send_rejects_before_mail_when_8bitmime_is_missing(rfc_email_client):
+    smtp = _smtp_with_extensions("SMTPUTF8")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        with pytest.raises(SMTPNotSupported, match="8BITMIME"):
+            await rfc_email_client.send_email(
+                ["recipient@example.test"],
+                "Subject",
+                "body",
+                reply_to="回复@example.test",
+            )
+
+    smtp.mail.assert_not_awaited()
+    smtp.sendmail.assert_not_awaited()
+    smtp.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unicode_reply_to_requires_smtputf8_for_ascii_envelope(rfc_email_client):
     smtp = _smtp_with_extensions("SMTPUTF8", "8BITMIME", "SIZE")
 
@@ -438,6 +479,24 @@ async def test_unicode_reply_to_requires_smtputf8_for_ascii_envelope(rfc_email_c
     assert reply_to is not None
     assert [address.addr_spec for address in reply_to.addresses] == ["回复@example.test"]
     assert [type(defect).__name__ for defect in reply_to.defects] == ["NonASCIILocalPartDefect"]
+
+
+@pytest.mark.asyncio
+async def test_smtputf8_outcome_rejects_before_mail_when_8bitmime_is_missing(rfc_email_client):
+    smtp = _smtp_with_extensions("SMTPUTF8")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        outcome = await rfc_email_client.send_email_with_outcome(
+            ["recipient@example.test"],
+            "Subject",
+            "body",
+            reply_to="回复@example.test",
+        )
+
+    assert [(item.status, item.detail) for item in outcome.outcomes] == [("failed", "smtp-8bitmime-required")]
+    smtp.mail.assert_not_awaited()
+    smtp.rcpt.assert_not_awaited()
+    smtp.data.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -711,7 +770,7 @@ async def test_legacy_sent_copy_does_not_replay_ascii_append_after_timeout(rfc_e
 
 @pytest.mark.asyncio
 async def test_unicode_envelope_recipient_uses_smtputf8_for_mail_rcpt_and_data(rfc_email_client):
-    smtp = _smtp_with_extensions("SMTPUTF8")
+    smtp = _smtp_with_extensions("SMTPUTF8", "8BITMIME")
 
     with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
         outcome = await rfc_email_client.send_email_with_outcome(
@@ -721,7 +780,11 @@ async def test_unicode_envelope_recipient_uses_smtputf8_for_mail_rcpt_and_data(r
         )
 
     assert [(item.status, item.detail) for item in outcome.outcomes] == [("succeeded", None)]
-    smtp.mail.assert_awaited_once_with("test@example.com", options=["SMTPUTF8"], encoding="utf-8")
+    smtp.mail.assert_awaited_once_with(
+        "test@example.com",
+        options=["SMTPUTF8", "BODY=8BITMIME"],
+        encoding="utf-8",
+    )
     smtp.rcpt.assert_awaited_once_with("用户@example.test", encoding="utf-8")
     assert "用户@example.test".encode() in smtp.data.await_args.args[0]
 

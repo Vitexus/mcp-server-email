@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import imaplib
 import importlib.metadata
+import json
 import os
 import re
 import smtplib
@@ -13,7 +15,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from email import policy
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
@@ -24,7 +26,7 @@ from typing import Any
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.types import TextContent
+from mcp.types import BlobResourceContents, EmbeddedResource, TextContent
 
 from mcp_email_server.bootstrap import read_bootstrap
 from mcp_email_server.managed import SCHEMA_VERSION
@@ -40,6 +42,7 @@ BOB = ("bob@example.test", "bob-password")
 
 CONFIG_TEMPLATE = f"""credential_storage = "plaintext"
 enable_attachment_download = true
+enable_attachment_content = true
 allowed_recipients = ["bob@example.test"]
 
 [[emails]]
@@ -48,6 +51,12 @@ full_name = "alice@example.test"
 email_address = "alice@example.test"
 save_to_sent = true
 sent_folder_name = "Sent"
+
+[[emails.tags]]
+name = "todo"
+keyword = "$label4"
+description = "Messages requiring an action"
+writable = true
 
 [emails.incoming]
 user_name = "alice@example.test"
@@ -191,8 +200,54 @@ def _seed_message_as(
         smtp.send_message(message)
 
 
+def _seed_message_with_attachment_as(
+    sender: tuple[str, str],
+    recipient: str,
+    subject: str,
+    body: str,
+    *,
+    filename: str,
+    payload: bytes,
+    maintype: str,
+    subtype: str,
+) -> None:
+    """Plant a real multipart source message so a forward has parts to carry."""
+    message = EmailMessage()
+    message["From"] = sender[0]
+    message["To"] = recipient
+    message["Subject"] = subject
+    message["Message-ID"] = make_msgid(domain="example.test")
+    message.set_content(body)
+    message.add_attachment(payload, maintype=maintype, subtype=subtype, filename=filename)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5) as smtp:
+        smtp.login(*sender)
+        smtp.send_message(message)
+
+
 def _seed_message(subject: str, body: str) -> None:
     _seed_message_as(ALICE, BOB[0], subject, body)
+
+
+def _append_message_at(
+    credentials: tuple[str, str],
+    mailbox: str,
+    *,
+    sender: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    internal_date: datetime,
+) -> None:
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = recipient
+    message["Subject"] = subject
+    message["Date"] = "Fri, 01 Jan 1999 00:00:00 +0000"
+    message["Message-ID"] = make_msgid(domain="example.test")
+    message.set_content(body)
+    with _imap_session(credentials) as client:
+        status, _ = client.append(mailbox, None, internal_date, message.as_bytes())
+        assert status == "OK"
 
 
 def _mark_deleted_without_expunge(credentials: tuple[str, str], mailbox: str, uid: str) -> None:
@@ -221,6 +276,33 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, Any
     assert result.isError is not True, f"{name} failed: {_text_content(result)}"
     assert result.structuredContent is not None, f"{name} returned no structured content"
     return result.structuredContent
+
+
+async def _assert_empty_recipient_policy_blocks_compose(
+    session: ClientSession, account_name: str, source_uid: str
+) -> None:
+    assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == []
+    counts_before = (
+        _message_count(BOB, "INBOX"),
+        _message_count(ALICE, "Drafts"),
+        _message_count(ALICE, "INBOX"),
+    )
+    for tool_name, arguments in (
+        ("send_email", {"subject": "Denied send", "body": "Synthetic body"}),
+        ("forward_email", {"email_id": source_uid}),
+        ("save_to_mailbox", {"subject": "Denied draft", "body": "Synthetic body"}),
+    ):
+        result = await session.call_tool(
+            tool_name, arguments={"account_name": account_name, "recipients": [BOB[0]], **arguments}
+        )
+        assert result.isError is True
+        assert "An empty allowlist denies all recipients" in _text_content(result)
+        assert "CLI/UI" in _text_content(result)
+    assert (
+        _message_count(BOB, "INBOX"),
+        _message_count(ALICE, "Drafts"),
+        _message_count(ALICE, "INBOX"),
+    ) == counts_before
 
 
 async def _metadata_for_subject_in_mailbox(
@@ -255,11 +337,27 @@ def _run_cli(console_script: Path, env: dict[str, str], arguments: list[str], *,
     return completed.stdout
 
 
+def _update_recipient_policy(console_script: Path, env: dict[str, str], recipients: str) -> None:
+    policy = json.loads(_run_cli(console_script, env, ["config", "policy", "--json"]))["data"]
+    _run_cli(
+        console_script,
+        env,
+        [
+            "config",
+            "update-policy",
+            "--expected-revision",
+            str(policy["revision"]),
+            "--allowed-recipients",
+            recipients,
+        ],
+    )
+
+
 @pytest.mark.asyncio
 async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenmail(tmp_path: Path) -> None:
     """Prove CLI setup -> test -> restart -> live managed IMAP without catalog activation."""
     _wait_until_ready()
-    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts", "Archive"])
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts", "Archive", "WildcardDrafts"])
     subject = f"managed-index-{uuid.uuid4().hex}"
     _seed_message_as(BOB, ALICE[0], subject, "Managed indexed metadata")
     _wait_for_message(ALICE, "INBOX", subject)
@@ -355,6 +453,41 @@ async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenm
                 assert connection.execute("SELECT completeness FROM index_coverage").fetchone()[0] == "COMPLETE"
 
             managed_uid = metadata["emails"][0]["email_id"]
+            await _assert_empty_recipient_policy_blocks_compose(session, "alice-managed", managed_uid)
+            # Policy changes must be visible in this same stdio session: default
+            # denial -> explicit permission -> clearing the last recipient.
+            _update_recipient_policy(console_script, server_env, BOB[0])
+            assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == [BOB[0]]
+            allowed_subject = f"managed-allowed-{uuid.uuid4().hex}"
+            await _call_tool(
+                session,
+                "send_email",
+                {
+                    "account_name": "alice-managed",
+                    "recipients": [BOB[0]],
+                    "subject": allowed_subject,
+                    "body": "Explicitly allowed synthetic message",
+                },
+            )
+            _wait_for_message(BOB, "INBOX", allowed_subject)
+            _update_recipient_policy(console_script, server_env, "*")
+            assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == ["*"]
+            wildcard_draft_subject = f"managed-wildcard-draft-{uuid.uuid4().hex}"
+            await _call_tool(
+                session,
+                "save_to_mailbox",
+                {
+                    "account_name": "alice-managed",
+                    "recipients": ["dynamic@partner.test"],
+                    "subject": wildcard_draft_subject,
+                    "mailbox": "WildcardDrafts",
+                    "body": "Explicit wildcard draft",
+                },
+            )
+            _wait_for_message(ALICE, "WildcardDrafts", wildcard_draft_subject)
+            _update_recipient_policy(console_script, server_env, "")
+            await _assert_empty_recipient_policy_blocks_compose(session, "alice-managed", managed_uid)
+            _update_recipient_policy(console_script, server_env, BOB[0])
             mark = await _call_tool(
                 session,
                 "mark_emails_as_read",
@@ -699,9 +832,23 @@ async def test_metadata_index_paging_fallback_and_restart_reuse_against_greenmai
     _ensure_empty_mailboxes(BOB, ["INBOX"])
     run_id = uuid.uuid4().hex
     subjects = [f"metadata-index-{run_id}-{number}" for number in range(5)]
-    for number, subject in enumerate(subjects):
-        _seed_message(subject, f"indexed body {number}; unique needle {run_id}-{number}")
-        _wait_for_message(BOB, "INBOX", subject)
+    internal_dates = [
+        datetime(2026, 9, 2, 16, 47, 59, tzinfo=UTC),
+        datetime(2026, 9, 2, 16, 48, tzinfo=UTC),
+        datetime(2026, 9, 2, 17, 0, tzinfo=UTC),
+        datetime(2026, 9, 2, 19, 12, 59, tzinfo=UTC),
+        datetime(2026, 9, 2, 19, 13, tzinfo=UTC),
+    ]
+    for number, (subject, internal_date) in enumerate(zip(subjects, internal_dates, strict=True)):
+        _append_message_at(
+            BOB,
+            "INBOX",
+            sender=ALICE[0],
+            recipient=BOB[0],
+            subject=subject,
+            body=f"indexed body {number}; unique needle {run_id}-{number}",
+            internal_date=internal_date,
+        )
     flagged = _wait_for_message(BOB, "INBOX", subjects[2])
     _add_flags(BOB, "INBOX", flagged.uid, r"\Seen \Flagged")
 
@@ -780,6 +927,31 @@ async def test_metadata_index_paging_fallback_and_restart_reuse_against_greenmai
                             {"account_name": "bob", "page_size": 10, **filters},
                         )
                         assert result["total"] == expected_total, (filters, result)
+
+                    datetime_arguments = {
+                        "account_name": "bob",
+                        "page_size": 2,
+                        "since": "2026-09-02T16:48:00Z",
+                        "before": "2026-09-02T19:13:00Z",
+                    }
+                    datetime_first = await _call_tool(
+                        session,
+                        "list_emails_metadata",
+                        datetime_arguments,
+                    )
+                    datetime_second = await _call_tool(
+                        session,
+                        "list_emails_metadata",
+                        {**datetime_arguments, "page": 2},
+                    )
+                    assert datetime_first["total"] == datetime_second["total"] == 3
+                    assert [email["subject"] for email in datetime_first["emails"]] == [subjects[3], subjects[2]]
+                    assert [email["subject"] for email in datetime_second["emails"]] == [subjects[1]]
+                    assert all(
+                        email["date"].startswith("1999-01-01")
+                        for email in datetime_first["emails"] + datetime_second["emails"]
+                    )
+
                     invalid = await session.call_tool(
                         "list_emails_metadata",
                         arguments={"account_name": "bob", "page_size": 101},
@@ -791,6 +963,109 @@ async def test_metadata_index_paging_fallback_and_restart_reuse_against_greenmai
     restart_observed_at, restart_page = await exercise_session(verify_filters=False)
     assert restart_observed_at == first_observed_at
     assert restart_page == first_page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_source", ["unset", "empty-toml", "empty-env"])
+async def test_legacy_empty_recipient_policy_against_greenmail(tmp_path: Path, policy_source: str) -> None:
+    _wait_until_ready()
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts"])
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+    subject = f"denied-forward-source-{uuid.uuid4().hex}"
+    _seed_message_as(BOB, ALICE[0], subject, "Synthetic forward source")
+    source = _wait_for_message(ALICE, "INBOX", subject)
+    config = CONFIG_TEMPLATE
+    if policy_source == "unset":
+        config = config.replace('allowed_recipients = ["bob@example.test"]\n', "")
+    elif policy_source == "empty-toml":
+        config = config.replace('allowed_recipients = ["bob@example.test"]', "allowed_recipients = []")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(config)
+    config_path.chmod(0o600)
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    })
+    if policy_source == "empty-env":
+        server_env["MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS"] = ""
+    server = StdioServerParameters(
+        command=str(Path(sys.executable).with_name("mcp-email-server")),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+            await session.initialize()
+            metadata = await _metadata_for_subject(session, "alice", subject)
+            assert metadata["email_id"] == source.uid
+            await _assert_empty_recipient_policy_blocks_compose(session, "alice", source.uid)
+            assert r"\Seen" not in _wait_for_message(ALICE, "INBOX", subject).flags
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern", ["*", "*@*", "*@example.test", "[ab]*@example.test"])
+async def test_recipient_globs_against_greenmail(tmp_path: Path, pattern: str) -> None:
+    """Explicit wildcard authority permits send, forward, and recipient-bound APPEND."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Sent", "Drafts"])
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        CONFIG_TEMPLATE.replace('allowed_recipients = ["bob@example.test"]', f'allowed_recipients = ["{pattern}"]')
+    )
+    config_path.chmod(0o600)
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({"MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path), "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING"})
+    server = StdioServerParameters(
+        command=str(Path(sys.executable).with_name("mcp-email-server")),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+            await session.initialize()
+            assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == [pattern]
+            subject = f"glob-{uuid.uuid4().hex}"
+            await _call_tool(
+                session,
+                "send_email",
+                {
+                    "account_name": "alice",
+                    "recipients": [BOB[0]],
+                    "cc": [ALICE[0]],
+                    "subject": subject,
+                    "body": "Synthetic wildcard delivery",
+                },
+            )
+            _wait_for_message(BOB, "INBOX", subject)
+            _wait_for_message(ALICE, "INBOX", subject)
+            source = await _metadata_for_subject(session, "alice", subject)
+            await _call_tool(
+                session,
+                "forward_email",
+                {
+                    "account_name": "alice",
+                    "email_id": source["email_id"],
+                    "recipients": [ALICE[0]],
+                },
+            )
+            _wait_for_message(ALICE, "INBOX", f"Fwd: {subject}")
+            await _call_tool(
+                session,
+                "save_to_mailbox",
+                {
+                    "account_name": "alice",
+                    "recipients": [BOB[0]],
+                    "bcc": [ALICE[0]],
+                    "subject": f"draft-{subject}",
+                    "body": "Synthetic wildcard draft",
+                },
+            )
+            _wait_for_message(ALICE, "Drafts", f"draft-{subject}")
+            assert _find_message(BOB, "INBOX", f"draft-{subject}") is None
 
 
 @pytest.mark.asyncio
@@ -846,6 +1121,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                 "list_emails_metadata",
                 "get_emails_content",
                 "send_email",
+                "forward_email",
                 "save_to_mailbox",
                 "delete_emails",
                 "set_email_flags",
@@ -854,6 +1130,9 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                 "archive_emails",
                 "list_mailboxes",
                 "download_attachment",
+                "get_attachment_content",
+                "list_email_tags",
+                "set_email_tags",
             } <= tool_names
 
             accounts = await _call_tool(session, "list_available_accounts", {})
@@ -872,9 +1151,14 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                     "references": references,
                 },
             )
-            assert send_result["result"] == f"Email sent successfully to {BOB[0]} with 1 attachment(s)"
+            send_prefix = f"Email sent successfully to {BOB[0]} with 1 attachment(s). Message-Id: "
+            assert send_result["result"].startswith(send_prefix)
+            reported_message_id = send_result["result"].removeprefix(send_prefix)
 
             delivered = _wait_for_message(BOB, "INBOX", sent_subject)
+            # The reported identifier must be the one the recipient actually received,
+            # so a caller's send journal can cite it without a second lookup.
+            assert str(delivered.message["Message-ID"]) == reported_message_id
             assert sent_body in (delivered.message.get_body(preferencelist=("plain",)).get_content())
             delivered_from = delivered.message["From"]
             assert delivered_from is not None
@@ -923,6 +1207,141 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             assert "not in allowlist" in _text_content(denied_send)
             assert _find_message(BOB, "INBOX", denied_subject) is None
             assert _find_message(ALICE, "Sent", denied_subject) is None
+
+            forward_source_subject = f"mcp-e2e-forward-source-{run_id}"
+            forward_source_body = f"Original content that must survive the forward {run_id}"
+            forwarded_attachment_bytes = b"forwarded attachment bytes \x00\xfe\n"
+            forwarded_attachment_name = "forwarded-report.pdf"
+            _seed_message_with_attachment_as(
+                BOB,
+                ALICE[0],
+                forward_source_subject,
+                forward_source_body,
+                filename=forwarded_attachment_name,
+                payload=forwarded_attachment_bytes,
+                maintype="application",
+                subtype="pdf",
+            )
+            _wait_for_message(ALICE, "INBOX", forward_source_subject)
+            forward_source_metadata = await _metadata_for_subject(session, "alice", forward_source_subject)
+            tagged = await _call_tool(
+                session,
+                "set_email_tags",
+                {
+                    "account_name": "alice",
+                    "email_ids": [forward_source_metadata["email_id"]],
+                    "operation": "add",
+                    "tags": ["todo"],
+                },
+            )
+            assert tagged["result"] == "Successfully added configured tags on 1 email(s)"
+            source_with_tag = _wait_for_message(ALICE, "INBOX", forward_source_subject)
+            assert "$label4" in {flag.casefold() for flag in source_with_tag.flags}
+            tagged_metadata = await _metadata_for_subject(session, "alice", forward_source_subject)
+            assert "$label4" in {keyword.casefold() for keyword in tagged_metadata["provider_keywords"]}
+            assert tagged_metadata["semantic_tags"] == ["todo"]
+
+            attachment_content = await session.call_tool(
+                "get_attachment_content",
+                arguments={
+                    "account_name": "alice",
+                    "email_id": forward_source_metadata["email_id"],
+                    "attachment_name": forwarded_attachment_name,
+                },
+            )
+            assert attachment_content.isError is not True
+            assert attachment_content.structuredContent is None
+            assert len(attachment_content.content) == 1
+            embedded = attachment_content.content[0]
+            assert isinstance(embedded, EmbeddedResource)
+            assert isinstance(embedded.resource, BlobResourceContents)
+            assert embedded.resource.mimeType == "application/pdf"
+            assert embedded.resource.blob == base64.b64encode(forwarded_attachment_bytes).decode("ascii")
+            assert embedded.meta == {
+                "filename": forwarded_attachment_name,
+                "size": len(forwarded_attachment_bytes),
+            }
+
+            untagged = await _call_tool(
+                session,
+                "set_email_tags",
+                {
+                    "account_name": "alice",
+                    "email_ids": [forward_source_metadata["email_id"]],
+                    "operation": "remove",
+                    "tags": ["todo"],
+                },
+            )
+            assert untagged["result"] == "Successfully removed configured tags on 1 email(s)"
+            source_without_tag = _wait_for_message(ALICE, "INBOX", forward_source_subject)
+            assert "$label4" not in {flag.casefold() for flag in source_without_tag.flags}
+            untagged_metadata = await _metadata_for_subject(session, "alice", forward_source_subject)
+            assert "$label4" not in {keyword.casefold() for keyword in untagged_metadata["provider_keywords"]}
+            assert untagged_metadata["semantic_tags"] == []
+
+            forward_note = f"Please review this {run_id}"
+            forward_result = await _call_tool(
+                session,
+                "forward_email",
+                {
+                    "account_name": "alice",
+                    "email_id": forward_source_metadata["email_id"],
+                    "recipients": [BOB[0]],
+                    "body": forward_note,
+                },
+            )
+            forward_prefix = f"Email forwarded successfully to {BOB[0]}. Message-Id: "
+            assert forward_result["result"].startswith(forward_prefix)
+            reported_forward_message_id = forward_result["result"].removeprefix(forward_prefix)
+
+            # Read the delivered forward back over plain imaplib rather than trusting
+            # the server's own report of what it claims to have sent.
+            forwarded_subject = f"Fwd: {forward_source_subject}"
+            forwarded = _wait_for_message(BOB, "INBOX", forwarded_subject)
+            assert str(forwarded.message["Message-ID"]) == reported_forward_message_id
+            forwarded_text = forwarded.message.get_body(preferencelist=("plain",)).get_content()
+            assert forward_note in forwarded_text
+            assert "---------- Forwarded message ----------" in forwarded_text
+            assert f"From: {BOB[0]}" in forwarded_text
+            assert f"Recipients: {ALICE[0]}" in forwarded_text
+            assert f"Subject: {forward_source_subject}" in forwarded_text
+            assert forward_source_body in forwarded_text
+            forwarded_parts = list(forwarded.message.iter_attachments())
+            assert len(forwarded_parts) == 1
+            assert forwarded_parts[0].get_content_type() == "application/pdf"
+            assert forwarded_parts[0].get_filename() == forwarded_attachment_name
+            assert forwarded_parts[0].get_payload(decode=True) == forwarded_attachment_bytes
+
+            # The source read is a pure peek: forwarding must not mark the
+            # source message as read.
+            source_after_forward = _find_message(ALICE, "INBOX", forward_source_subject)
+            assert source_after_forward is not None
+            assert r"\Seen" not in source_after_forward.flags
+
+            forwarded_sent_copy = _wait_for_message(ALICE, "Sent", forwarded_subject)
+            forwarded_sent_text = forwarded_sent_copy.message.get_body(preferencelist=("plain",)).get_content()
+            assert forward_note in forwarded_sent_text
+            assert forward_source_body in forwarded_sent_text
+            assert [part.get_filename() for part in forwarded_sent_copy.message.iter_attachments()] == [
+                forwarded_attachment_name
+            ]
+
+            denied_forward_subject = f"mcp-e2e-forward-denied-{run_id}"
+            _seed_message_as(BOB, ALICE[0], denied_forward_subject, "This forward must never leave the process")
+            _wait_for_message(ALICE, "INBOX", denied_forward_subject)
+            denied_forward_metadata = await _metadata_for_subject(session, "alice", denied_forward_subject)
+            denied_forward = await session.call_tool(
+                "forward_email",
+                arguments={
+                    "account_name": "alice",
+                    "email_id": denied_forward_metadata["email_id"],
+                    "recipients": [denied_recipient],
+                },
+            )
+            assert denied_forward.isError is True
+            assert "not in allowlist" in _text_content(denied_forward)
+            assert _find_message(BOB, "INBOX", f"Fwd: {denied_forward_subject}") is None
+            assert _find_message(ALICE, "Sent", f"Fwd: {denied_forward_subject}") is None
 
             sent_metadata = await _metadata_for_subject(session, "bob", sent_subject)
             assert sent_metadata["sender"].endswith("<alice@example.test>") or sent_metadata["sender"] == ALICE[0]

@@ -15,6 +15,35 @@ MCP_EMAIL_SERVER_LOG_LEVEL=DEBUG mcp-email-server stdio
 
 Restart the server after changing configuration paths or environment variables.
 
+## Recipient allowlist errors
+
+If sending or saving reports `Recipient(s) not in allowlist`, check that every
+To, CC, and BCC address matches an entry in `allowed_recipients`. An empty list
+blocks `send_email`, `forward_email`, and `save_to_mailbox`, even when SMTP or
+IMAP credentials work. This applies in both managed and legacy mode. Earlier
+implementations incorrectly allowed any recipient for an empty list; see the
+[upgrade note](security.md#recipient-policy-upgrade-note).
+
+In managed mode, add the intended addresses or glob patterns in the Web UI policy panel, or run
+`mcp-email-server config policy` and then update using the displayed revision:
+
+```bash
+mcp-email-server config update-policy --expected-revision <revision> --allowed-recipients 'alice@example.com,bob@example.com'
+```
+
+This replaces the whole recipient list, so include any existing addresses that
+should remain allowed. Clearing the list disables these three operations; it
+never enables unrestricted sending. In legacy mode, configure `allowed_recipients`
+in TOML or `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS` in the server environment and
+restart. An explicitly empty environment value overrides a non-empty TOML list.
+`list_allowed_recipients` shows the effective policy without exposing credentials.
+
+For changing draft recipients, add `*@example.com` for an allowed domain, or
+explicitly use `*` (or `*@*`) for all valid recipients. For example, use
+`--allowed-recipients '*'` in the command above. Quote shell patterns. This also
+permits sending and forwarding to matching recipients; it is not a draft-only
+permission. Leaving the list empty is not an allow-all shortcut.
+
 ## The server reports `Missing command`
 
 The CLI requires a subcommand. Use one of:
@@ -114,13 +143,19 @@ sidecar itself is unparseable, repair or restore that sidecar manually; `reset`
 cannot safely infer its mode and therefore does not unlink the independent legacy
 source.
 
-There are no released managed-catalog users for this pre-release redesign, so
-older development catalog schemas are rejected rather than migrated. While
-legacy mode is selected, preserve the old file for rollback and initialize a
-fresh owner-only path with `mcp-email-server config init --database NEW_PATH`.
-Then re-enter accounts or use the reviewed legacy import flow. Fresh setup
-selects managed immediately; an existing v1 source remains selected until a
-complete import succeeds. Remove the obsolete development catalog only after verifying the
+Schema v3 is the only supported pre-release managed-catalog migration source.
+The first v4 open performs that migration transactionally, preserving account,
+policy, binding, and secret rows while initializing empty tag mappings and a
+disabled attachment-content policy. If startup was attempted before upgrading
+the application, restart it after checking out the v4-capable version. A failed
+migration rolls back without advertising v4.
+
+Other older development schemas are still rejected. For those versions, select
+legacy mode, preserve the old file for rollback, and initialize a fresh
+owner-only path with `mcp-email-server config init --database NEW_PATH`. Then
+re-enter accounts or use the reviewed legacy import flow. Fresh setup selects
+managed immediately; an existing v1 source remains selected until a complete
+import succeeds. Remove an obsolete development catalog only after verifying the
 replacement; on Linux and Windows, treat every old catalog copy as
 secret-bearing.
 
@@ -199,12 +234,14 @@ again.
 so the application could not prove the requested page and exact filtered total
 within its work budget. Narrow the mailbox or add a date, sender, recipient,
 subject, body, text, flag, or attachment filter. Increasing `page_size` cannot
-bypass the limit; `page_size` is restricted to 1 through 100. An `invalid UID
-search results` or incomplete provider-metadata error means the server returned
-a malformed UID set or did not return exact sender/INTERNALDATE evidence for
-every requested UID. The request is rejected rather than expanding a UID range
-or returning an incorrect page; retry after the mailbox is stable or report the
-provider issue.
+bypass the limit; `page_size` is restricted to 1 through 100. Some providers,
+including iCloud, omit the untagged empty `SEARCH` response and return only a
+successful tagged completion line; this known response shape is treated as zero
+matches. An `invalid UID search results` or incomplete provider-metadata error
+means the server returned another malformed UID set or did not return exact
+sender/INTERNALDATE evidence for every requested UID. The request is rejected
+rather than expanding a UID range or returning an incorrect page; retry after
+the mailbox is stable or report the provider issue.
 
 Non-ASCII subject, body, text, sender, or recipient filters are sent as
 synchronizing UTF-8 IMAP literals with `CHARSET UTF-8`. If a provider rejects the
@@ -328,10 +365,12 @@ The migration command prints a warning when the values conflict.
 Migration changes only persistent TOML accounts. It does not migrate an
 account supplied solely through environment variables.
 
-## `send_email` reports that SMTP is unavailable
+## `send_email` or `forward_email` reports that SMTP is unavailable
 
-`send_email` is always advertised in the static MCP catalog. If sending fails
-for one account, confirm that the selected account is enabled and has a complete
+`send_email` and `forward_email` are always advertised in the static MCP
+catalog, and both fail their SMTP capability check for an account without an
+outgoing endpoint — a forward is refused before its source message is even
+read. If sending fails for one account, confirm that the selected account is enabled and has a complete
 SMTP endpoint and active outgoing credential. In managed mode, inspect it with
 `account show`; disable it before changing or removing credentials, then
 re-enable it with the latest revision. Run `account test ACCOUNT outgoing` to
@@ -350,7 +389,23 @@ thread header requires internationalized syntax but the SMTP server did not
 advertise SMTPUTF8; the server rejects before issuing `MAIL FROM`, `RCPT TO`, or
 `DATA`. Use an ASCII addr-spec/header value or a provider with SMTPUTF8 support.
 A non-ASCII display name attached to an ASCII address does not trigger this
-requirement. Results never include the provider's free-form response text.
+requirement.
+
+`smtp-8bitmime-required` means either a correctly labeled `8bit` MIME body needs
+raw high-bit transport or an SMTPUTF8 message is subject to RFC 6531's mandatory
+8BITMIME pairing, but the server did not advertise `8BITMIME`. Use a provider
+with that extension or, when SMTPUTF8 is not otherwise required, compose a
+7-bit-safe message whose parts use base64 or quoted-printable.
+`smtp-mime-transport-invalid` means raw high-bit payload bytes
+do not match their declared transfer encoding, so enabling `8BITMIME` would not
+make the MIME entity valid; correct or re-encode that source part.
+`smtp-binarymime-unsupported` means the message requires a binary transport path,
+for example because it declares a binary transfer encoding or contains NUL or
+DATA framing that ordinary line-oriented SMTP cannot carry. This client does not
+implement `BINARYMIME` with `CHUNKING`/`BDAT`; re-encode the affected leaf part as
+base64 before sending. Both failures happen before `MAIL FROM`, so they are known
+failures and must not be treated as ambiguous delivery. Results never include the
+provider's free-form response text.
 
 For delivery diagnostics, enable `DEBUG` and inspect the bounded SMTP records.
 `phase=connect` and `phase=authenticate` cover session setup; `phase=mail`,
@@ -416,6 +471,26 @@ only for a trusted local endpoint with a known self-signed certificate.
 
 For ProtonMail Bridge, copy the host, ports, username, and password shown by the
 bridge rather than using the normal account password.
+
+## Attachment content is unavailable to a remote MCP client
+
+`download_attachment` returns a path on the server machine. A ChatGPT app or
+other remote MCP client cannot read that path because it does not share the
+server filesystem. Enable the independent content-transfer mode instead:
+
+```toml
+enable_attachment_content = true
+```
+
+In legacy mode, you can also set
+`MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT=true`. In managed mode, use
+the **Allow attachments to be returned through MCP** checkbox or run
+`mcp-email-server config update-policy --enable-attachment-content`; confirm the
+stored value with `mcp-email-server config policy`. Managed runtime reads use
+this policy rather than legacy TOML or environment overrides. Then call
+`get_attachment_content`. If the encoded resource exceeds the existing global
+serialized-result ceiling, use a smaller attachment; the server does not create
+a temporary URL or split the blob into chunks.
 
 ## Attachment download is denied
 

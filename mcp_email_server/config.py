@@ -33,6 +33,7 @@ from mcp_email_server.bootstrap import (
     process_bootstrap,
     read_bootstrap,
 )
+from mcp_email_server.imap_keywords import ImapKeywordAccount, ImapKeywordTag
 from mcp_email_server.log import logger
 from mcp_email_server.windows_security import (
     atomic_write_private,
@@ -104,9 +105,16 @@ def sender_allowed(sender: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(addrs[0], pattern.lower()) for pattern in patterns)
 
 
-def normalize_address_list(raw: Iterable[str]) -> list[str]:
-    """Normalize each address, drop empties, de-duplicate (order-preserving)."""
-    return list(dict.fromkeys(a for a in (normalize_address(x) for x in raw) if a))
+def normalize_recipient_patterns(raw: Iterable[str]) -> list[str]:
+    """Normalize exact addresses and bare glob patterns without losing glob syntax.
+
+    Display-name addresses retain legacy address extraction. Bare patterns must
+    not go through ``parseaddr``, which can discard bracket expressions.
+    """
+    return normalize_pattern_list(
+        value if any(char in value for char in "*?[") and "<" not in value else normalize_address(value)
+        for value in raw
+    )
 
 
 def normalize_pattern_list(raw: Iterable[str]) -> list[str]:
@@ -117,20 +125,27 @@ def normalize_pattern_list(raw: Iterable[str]) -> list[str]:
 def compose_legacy_policy_environment(
     *,
     enable_attachment_download: bool,
+    enable_attachment_content: bool,
     allowed_recipients: Iterable[str],
     allowed_senders: Iterable[str],
     report_blocked_mutations: bool,
-) -> tuple[bool, list[str], list[str], bool]:
+) -> tuple[bool, bool, list[str], list[str], bool]:
     """Apply legacy policy environment precedence without resolving credentials."""
-    attachment_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+    attachment_download_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+    attachment_content_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT")
     report_value = os.getenv("MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS")
     recipients_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
     senders_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
     return (
-        _parse_bool_env(attachment_value, False) if attachment_value is not None else enable_attachment_download,
-        normalize_address_list(recipients_value.split(","))
+        _parse_bool_env(attachment_download_value, False)
+        if attachment_download_value is not None
+        else enable_attachment_download,
+        _parse_bool_env(attachment_content_value, False)
+        if attachment_content_value is not None
+        else enable_attachment_content,
+        normalize_recipient_patterns(recipients_value.split(","))
         if recipients_value is not None
-        else normalize_address_list(allowed_recipients),
+        else normalize_recipient_patterns(allowed_recipients),
         normalize_pattern_list(senders_value.split(","))
         if senders_value is not None
         else normalize_pattern_list(allowed_senders),
@@ -296,6 +311,12 @@ class EmailSettings(AccountAttributes):
     outgoing: EmailServer | None = None
     save_to_sent: bool = True  # Save sent emails to IMAP Sent folder
     sent_folder_name: str | None = None  # Override Sent folder name (auto-detect if None)
+    tags: tuple[ImapKeywordTag, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_tags(self) -> EmailSettings:
+        ImapKeywordAccount(tags=self.tags)
+        return self
 
     @property
     def can_send(self) -> bool:
@@ -469,6 +490,7 @@ class Settings(BaseSettings):
     providers: list[ProviderSettings] = []
     db_location: str = CONFIG_PATH.with_name("db.sqlite3").as_posix()
     enable_attachment_download: bool = False
+    enable_attachment_content: bool = False
     allowed_recipients: list[str] = []
     allowed_senders: list[str] = []
     report_blocked_mutations: bool = False
@@ -512,7 +534,7 @@ class Settings(BaseSettings):
         # TOML normalisation is unconditional (safe during migration loads too): it
         # only reshapes values already in the file, independent of env state.
         if self.allowed_recipients:
-            self.allowed_recipients = normalize_address_list(self.allowed_recipients)
+            self.allowed_recipients = normalize_recipient_patterns(self.allowed_recipients)
         if self.allowed_senders:
             self.allowed_senders = normalize_pattern_list(self.allowed_senders)
 
@@ -535,11 +557,13 @@ class Settings(BaseSettings):
         self._pickup_credential_storage_override()
         (
             self.enable_attachment_download,
+            self.enable_attachment_content,
             self.allowed_recipients,
             self.allowed_senders,
             self.report_blocked_mutations,
         ) = compose_legacy_policy_environment(
             enable_attachment_download=self.enable_attachment_download,
+            enable_attachment_content=self.enable_attachment_content,
             allowed_recipients=self.allowed_recipients,
             allowed_senders=self.allowed_senders,
             report_blocked_mutations=self.report_blocked_mutations,

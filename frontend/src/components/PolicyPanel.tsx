@@ -121,7 +121,7 @@ export function PolicyPanel({ api, target, onRevision }: { api: ManagementApi; t
             title="Allowed recipients"
             itemLabel="Recipient"
             addLabel="Add recipient"
-            help="Add addresses this server may send to. Empty means sending is disabled."
+            help="Add addresses or glob patterns such as *@example.com. * allows all recipients for sending, forwarding, and drafts. Empty disables these operations."
             values={recipients}
             onChange={setRecipients}
           />
@@ -137,6 +137,7 @@ export function PolicyPanel({ api, target, onRevision }: { api: ManagementApi; t
         </div>
         <div className="checkbox-column">
           <label><input type="checkbox" checked={policy.enable_attachment_download} onChange={(event) => setPolicy({ ...policy, enable_attachment_download: event.target.checked })} /> Allow attachments to be saved as files</label>
+          <label><input type="checkbox" checked={policy.enable_attachment_content} onChange={(event) => setPolicy({ ...policy, enable_attachment_content: event.target.checked })} /> Allow attachments to be returned through MCP</label>
           <label><input type="checkbox" checked={policy.report_blocked_mutations} onChange={(event) => setPolicy({ ...policy, report_blocked_mutations: event.target.checked })} /> Show when an email action is blocked by these settings</label>
         </div>
         <button className="with-icon" disabled={busy}><Save size={17} aria-hidden="true" />{busy ? 'Saving…' : 'Save safety settings'}</button>

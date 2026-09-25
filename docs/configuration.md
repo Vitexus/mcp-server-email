@@ -262,8 +262,9 @@ Selecting managed mode never deletes preserved legacy TOML rows, and selecting
 legacy mode never deletes the managed catalog.
 
 Managed policy updates use the same canonicalization as legacy configuration:
-recipient addresses are extracted and lowercased, sender glob patterns are
-trimmed and lowercased, and empty or duplicate entries are removed while
+recipient entries accept exact addresses (including display names) or bare glob
+patterns; sender entries also accept glob patterns. Entries are trimmed and
+lowercased without losing glob syntax, and empty or duplicate entries are removed while
 preserving first occurrence order. `config update-policy` preserves omitted
 fields; pass an empty value to `--allowed-recipients` or `--allowed-senders` to
 clear that list. These empty values differ deliberately: empty allowed recipients
@@ -271,6 +272,20 @@ disables sending, while empty allowed senders does not restrict reading. The Web
 UI represents each recipient or sender pattern as an individual add/edit/remove
 item rather than a comma-separated field. Every update requires the revision
 shown by `config policy`.
+
+For dynamic recipients, use `--allowed-recipients '*@example.com'` to allow a
+domain, or `--allowed-recipients '*'` to explicitly allow every valid recipient.
+`'*@*'` also allows all. Quote patterns to prevent shell expansion. Matching uses
+case-insensitive, whole-address globs (`*`, `?`, `[0-9]`), just like sender policy.
+In legacy mode use `allowed_recipients = ["*"]` in TOML or
+`MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS='*'` in the environment. These patterns
+apply equally to sending, forwarding, and saving drafts, not just drafts.
+
+An empty recipient policy also denies `save_to_mailbox`; it is not just an SMTP
+switch. This applies in managed and legacy mode, including an omitted legacy
+setting or an explicit empty environment override. Older implementations
+incorrectly treated an empty list as unrestricted; see the
+[recipient policy upgrade note](security.md#recipient-policy-upgrade-note).
 
 Endpoint ports must be between 1 and 65535, and implicit TLS cannot be combined
 with STARTTLS. `account add` checks the selected catalog and these non-secret
@@ -427,13 +442,16 @@ Managed storage uses one exact current schema for account authority, the
 platform-selected secret binding, and the operational projection. On Linux and
 Windows, any copy, snapshot, or backup of this database includes plaintext values
 from `managed_secret`; protect every copy with private access equivalent to the
-original and never treat the catalog as a non-secret database. There are no
-released managed-catalog users, so pre-release development schemas receive no
-compatibility or automatic-migration promise. Legacy TOML, environment, and
-keyring sources remain supported through explicit import. Unsupported, corrupt,
-or insecure managed storage fails closed. In legacy mode, an unavailable or unsafe operational
-database produces a bounded warning and the metadata query uses its bounded IMAP
-fallback instead.
+original and never treat the catalog as a non-secret database. Schema v3 is the
+only declared pre-release migration source: the first v4 open validates the exact
+v3 shape, transactionally adds empty account tag mappings and the disabled
+attachment-content policy, verifies the resulting schema and invariants, and
+records v4 only after those checks pass. Account, policy, binding, and secret
+rows are preserved. Other unsupported versions, corrupt storage, and insecure
+storage fail closed. Legacy TOML, environment, and keyring sources remain
+supported through explicit import. In legacy mode, an unavailable or unsafe
+operational database produces a bounded warning and the metadata query uses its
+bounded IMAP fallback instead.
 
 ## Legacy configuration precedence
 
@@ -480,6 +498,7 @@ The following example contains all commonly used account fields:
 ```toml
 credential_storage = "auto"
 enable_attachment_download = false
+enable_attachment_content = false
 allowed_recipients = []
 allowed_senders = []
 report_blocked_mutations = false
@@ -491,6 +510,12 @@ full_name = "John Doe"
 email_address = "john@example.com"
 save_to_sent = true
 sent_folder_name = "Sent"
+
+[[emails.tags]]
+name = "todo"
+keyword = "$label4"
+description = "Messages requiring an action"
+writable = true
 
 [emails.incoming]
 user_name = "john@example.com"
@@ -580,8 +605,12 @@ or an otherwise isolated network.
 ## IMAP-only accounts
 
 SMTP configuration is optional. The MCP tool catalog is static, so `send_email`
-is still advertised when every account omits SMTP; a call for an IMAP-only
-account fails its capability check before SMTP access.
+and `forward_email` are still advertised when every account omits SMTP; a call
+for an IMAP-only account fails its capability check before SMTP access.
+
+`forward_email` is a send even though it begins by reading a message over IMAP,
+so it also requires SMTP and cannot be used with an IMAP-only account. Its
+source read is attempted only after that capability check.
 
 IMAP-only does not mean read-only. These tools can still change mailbox state:
 
@@ -628,9 +657,11 @@ header. The configured full name is an RFC 5322 display name: punctuation such a
 an ASCII addr-spec is encoded without forcing SMTPUTF8. SMTP `MAIL FROM` always
 uses the separate configured account email address as its RFC 5321 reverse-path.
 An internationalized addr-spec or thread-header identifier requires SMTPUTF8 for
-delivery and RFC 6855 UTF8 support for Draft or Sent-copy APPEND. Drafts and Sent
-copies use the same correctly formatted `From` header and fail before APPEND when
-the provider cannot negotiate the required UTF8 mode.
+delivery and RFC 6855 UTF8 support for Draft or Sent-copy APPEND. RFC 6531 also
+requires the SMTP server to advertise 8BITMIME and the client to request
+`BODY=8BITMIME` whenever SMTPUTF8 is used. Drafts and Sent copies use the same
+correctly formatted `From` header and fail before APPEND when the provider cannot
+negotiate the required UTF8 mode.
 
 The server also adds `User-Agent: mcp-email-server` and
 `X-Mailer: mcp-email-server` as de-facto application identifiers for
@@ -639,16 +670,38 @@ identifiers are fixed and contain no account-specific information.
 
 ## Global settings
 
-| Setting                      | Default  | Description                                                                |
-| ---------------------------- | -------- | -------------------------------------------------------------------------- |
-| `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.               |
-| `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                |
-| `allowed_recipients`         | `[]`     | Exact recipients; empty disables sending and recipient-bound saves.        |
-| `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                 |
-| `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops. |
+| Setting                      | Default  | Description                                                                                          |
+| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.                                         |
+| `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                                          |
+| `enable_attachment_content`  | `false`  | Allow `get_attachment_content` to return attachment bytes through MCP.                               |
+| `allowed_recipients`         | `[]`     | Exact addresses or globs; `*` explicitly allows all; empty denies sending and recipient-bound saves. |
+| `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                                           |
+| `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops.                           |
+
+In managed mode, enable attachment content transfer with
+`mcp-email-server config update-policy --enable-attachment-content` and inspect
+it with `mcp-email-server config policy`. The current managed policy is applied
+when each account is resolved, independently of `enable_attachment_download`;
+legacy TOML and environment flags do not override it.
 
 See [Security](security.md) before enabling attachment downloads or applying
 allowlists.
+
+## Semantic IMAP tags
+
+Semantic tags belong to an email account. In managed mode, add or edit them in
+the account form in `mcp-email-server ui`. In legacy mode, define
+`[[emails.tags]]` entries inside the corresponding `[[emails]]` account, as
+shown in the TOML example above.
+
+`name` is the stable semantic value used by MCP tools; `keyword` is the provider
+IMAP keyword. Both are required and are unique within an account, ignoring case.
+`description` defaults to `""`, and `writable` defaults to `false`. Consequently,
+omitting `writable` never grants permission to change that tag. Keywords must be
+non-system IMAP keyword atoms; standard flags such as `\\Seen` are rejected.
+Managed changes are read from current account authority. Restart the MCP server
+after changing legacy TOML.
 
 ## Environment variable reference
 
@@ -686,7 +739,8 @@ values are treated as false. Do not add surrounding whitespace to these values.
 | Variable                                      | Default                                  | Description                                                         |
 | --------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
 | `MCP_EMAIL_SERVER_CONFIG_PATH`                | `~/.config/mcp-email-server/config.toml` | Use a custom TOML path.                                             |
-| `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD` | `false`                                  | Override attachment download access.                                |
+| `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD` | `false`                                  | Override attachment file-download access.                           |
+| `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT`  | `false`                                  | Override attachment MCP-content transfer access.                    |
 | `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`         | Empty                                    | Comma-separated recipients; empty disables sending.                 |
 | `MCP_EMAIL_SERVER_ALLOWED_SENDERS`            | Empty                                    | Comma-separated sender globs; empty does not restrict reading.      |
 | `MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS`   | `false`                                  | Override blocked mutation reporting.                                |

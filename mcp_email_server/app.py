@@ -1,3 +1,5 @@
+import base64
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -6,11 +8,11 @@ from typing import Annotated, Literal
 
 import anyio
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, ToolAnnotations
 from pydantic import Field
 
 from mcp_email_server.application.accounts import AvailableAccount, EffectiveConfiguration
-from mcp_email_server.application.limits import APPLICATION_LIMITS
+from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_serialized_result
 from mcp_email_server.application.metadata import ListEmailMetadataQuery
 from mcp_email_server.application.mutations import (
     MUTABLE_EMAIL_FLAGS,
@@ -20,6 +22,7 @@ from mcp_email_server.application.mutations import (
     BatchMutationOutcome,
     DeleteCommand,
     FlagOperation,
+    ForwardCommand,
     MarkReadCommand,
     MoveCommand,
     MutableEmailFlag,
@@ -28,6 +31,7 @@ from mcp_email_server.application.mutations import (
     SendCommand,
     SendMutationOutcome,
     SetEmailFlagsCommand,
+    SetEmailTagsCommand,
     TargetMutationOutcome,
 )
 from mcp_email_server.application.reads import (
@@ -41,6 +45,7 @@ from mcp_email_server.emails.models import (
     EmailMetadataPageResponse,
     MailboxInfo,
 )
+from mcp_email_server.imap_keywords import ImapKeywordTag
 from mcp_email_server.runtime import close_application_runtime, get_application_runtime
 
 MAX_IMAP_UID_CHARACTERS = len(str(APPLICATION_LIMITS.maximum_imap_uid))
@@ -70,6 +75,10 @@ async def send_email_command(command: SendCommand) -> SendMutationOutcome:
     return await get_application_runtime().mutations.send.execute(command)
 
 
+async def forward_email_command(command: ForwardCommand) -> SendMutationOutcome:
+    return await get_application_runtime().mutations.forward.execute(command)
+
+
 async def save_to_mailbox_command(command: SaveToMailboxCommand) -> AppendMutationOutcome:
     return await get_application_runtime().mutations.save_to_mailbox.execute(command)
 
@@ -80,6 +89,10 @@ async def delete_emails_command(command: DeleteCommand) -> BatchMutationOutcome:
 
 async def set_email_flags_command(command: SetEmailFlagsCommand) -> BatchMutationOutcome:
     return await get_application_runtime().mutations.set_flags.execute(command)
+
+
+async def set_email_tags_command(command: SetEmailTagsCommand) -> BatchMutationOutcome:
+    return await get_application_runtime().mutations.set_tags.execute(command)
 
 
 async def mark_read_command(command: MarkReadCommand) -> BatchMutationOutcome:
@@ -106,6 +119,10 @@ async def download_attachment_command(command: DownloadAttachmentCommand) -> Att
     return await get_application_runtime().reads.attachments.execute(command)
 
 
+async def get_attachment_content_command(command: DownloadAttachmentCommand):
+    return await get_application_runtime().reads.attachment_content.execute(command)
+
+
 def effective_configuration() -> EffectiveConfiguration:
     return get_application_runtime().configuration.execute()
 
@@ -113,7 +130,10 @@ def effective_configuration() -> EffectiveConfiguration:
 _PUBLIC_SEND_DETAILS = frozenset({
     "not-attempted",
     "provider-timeout",
+    "smtp-8bitmime-required",
+    "smtp-binarymime-unsupported",
     "smtp-cancelled-before-data",
+    "smtp-mime-transport-invalid",
     "smtp-data-rejected",
     "smtp-data-unknown",
     "smtp-mail-cancelled",
@@ -166,6 +186,24 @@ def _tagged_batch_result(outcome: BatchMutationOutcome) -> str:
     return "; ".join(sections)
 
 
+def _send_outcome_is_clean(outcome: SendMutationOutcome) -> bool:
+    """One owner for "every effect succeeded" so send and forward cannot drift."""
+    return (
+        all(item.status == "succeeded" for item in outcome.delivery)
+        and outcome.sent_copy.status in ("succeeded", "skipped")
+        and not outcome.reconciliation_needed
+    )
+
+
+def _reported_message_id(outcome: SendMutationOutcome) -> str:
+    """Name the delivered message only when the provider proved which one it took.
+
+    An ambiguous submission reports nothing here, so a caller journaling the send
+    records an empty identifier instead of one the server cannot vouch for.
+    """
+    return f". Message-Id: {outcome.message_id}" if outcome.message_id else ""
+
+
 def _tagged_send_result(outcome: SendMutationOutcome) -> str:
     sections = _ordered_target_sections(
         outcome.delivery,
@@ -181,6 +219,8 @@ def _tagged_send_result(outcome: SendMutationOutcome) -> str:
         sent_copy_context.append(outcome.sent_copy.detail)
     if sent_copy_context:
         sent_copy = f"{sent_copy} ({'; '.join(sent_copy_context)})"
+    if outcome.message_id:
+        sections.append(f"message-id: {outcome.message_id}")
     sections.append(f"sent-copy: {sent_copy}")
     if outcome.reconciliation_needed:
         sections.append("warning: reconciliation needed")
@@ -249,8 +289,9 @@ async def get_account(account_name: str) -> AvailableAccount | None:
 @mcp.tool(
     description=(
         "List configured accounts as stable non-secret capability records. Use only accounts with "
-        "can_receive=true for mail reads and can_send=true for send_email. If the result is empty, ask the "
-        "user to run `mcp-email-server ui` or the user-operated CLI; never ask for credentials in chat."
+        "can_receive=true for mail reads and can_send=true for send_email and forward_email. If the result is "
+        "empty, ask the user to run `mcp-email-server ui` or the user-operated CLI; never ask for credentials "
+        "in chat."
     ),
     annotations=_READ_ONLY_LOCAL,
 )
@@ -259,7 +300,26 @@ async def list_available_accounts() -> AccountDiscoveryResult:
 
 
 @mcp.tool(
-    description="List email metadata (email_id, subject, sender, recipients, date) without body content. Returns email_id for use with get_emails_content.",
+    description=(
+        "List the configured semantic IMAP tags for one account. The name and description support natural-language "
+        "selection; writable is false unless explicitly enabled in the account configuration."
+    ),
+    annotations=_READ_ONLY_LOCAL,
+)
+async def list_email_tags(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+) -> list[ImapKeywordTag]:
+    return list(get_application_runtime().metadata.list_tags(account_name))
+
+
+@mcp.tool(
+    description=(
+        "List email metadata (email_id, subject, sender, recipients, date) without body content. "
+        "Time filtering and ordering use provider INTERNALDATE; the returned date is the message's RFC 5322 Date header. "
+        "Returns email_id for use with get_emails_content."
+    ),
     annotations=_READ_ONLY_REMOTE,
 )
 async def list_emails_metadata(
@@ -276,11 +336,23 @@ async def list_emails_metadata(
     ] = 10,
     before: Annotated[
         datetime | None,
-        Field(default=None, description="Retrieve emails before this datetime (UTC)."),
+        Field(
+            default=None,
+            description=(
+                "Filter to messages whose provider INTERNALDATE is earlier than this timezone-aware datetime "
+                "(exclusive); any UTC offset is accepted and normalized to UTC."
+            ),
+        ),
     ] = None,
     since: Annotated[
         datetime | None,
-        Field(default=None, description="Retrieve emails since this datetime (UTC)."),
+        Field(
+            default=None,
+            description=(
+                "Filter to messages whose provider INTERNALDATE is equal to or later than this timezone-aware "
+                "datetime (inclusive); any UTC offset is accepted and normalized to UTC."
+            ),
+        ),
     ] = None,
     subject: Annotated[
         str | None,
@@ -308,7 +380,10 @@ async def list_emails_metadata(
     ] = None,
     order: Annotated[
         Literal["asc", "desc"],
-        Field(default=None, description="Sort matching emails by date: oldest first (`asc`) or newest first (`desc`)."),
+        Field(
+            default=None,
+            description="Sort matching emails by provider INTERNALDATE: oldest first (`asc`) or newest first (`desc`).",
+        ),
     ] = "desc",
     mailbox: Annotated[
         str,
@@ -354,6 +429,18 @@ async def list_emails_metadata(
             "(multipart/mixed heuristic; may miss inline images or yield false positives).",
         ),
     ] = None,
+    semantic_tags: Annotated[
+        list[FlagInput] | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.flags,
+            description="Configured semantic tag names to match.",
+        ),
+    ] = None,
+    tag_match: Annotated[
+        Literal["all", "any"],
+        Field(default="all", description="Require all requested tags or at least any one requested tag."),
+    ] = "all",
 ) -> EmailMetadataPageResponse:
     return await list_email_metadata(
         ListEmailMetadataQuery(
@@ -373,6 +460,8 @@ async def list_emails_metadata(
             body=body,
             text=text,
             has_attachment=has_attachment,
+            semantic_tags=tuple(semantic_tags or ()),
+            tag_match=tag_match,
         )
     )
 
@@ -447,8 +536,10 @@ async def get_emails_content(
 
 @mcp.tool(
     description=(
-        "List the configured recipient allowlist — the addresses that send_email is permitted to "
-        "send to and save_to_mailbox is permitted to address. Returns an empty list when unrestricted."
+        "List the configured recipient allowlist — the address patterns that send_email and forward_email are "
+        "permitted to send to and save_to_mailbox is permitted to address. Matching is case-insensitive and "
+        "supports glob patterns such as *@example.com; * explicitly allows all recipients. An empty list "
+        "denies all recipients for these operations; configure patterns through the user-operated CLI/UI."
     ),
     annotations=_READ_ONLY_LOCAL,
 )
@@ -460,7 +551,8 @@ async def list_allowed_recipients() -> PolicyDiscoveryResult:
     description=(
         "List the configured inbound sender allowlist — the address patterns whose mail the server "
         "will read or act on. When configured, only these senders' mail is visible to the read tools "
-        "(list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation "
+        "(list_emails_metadata, get_emails_content, download_attachment, and forward_email's source read) "
+        "and eligible for the mutation "
         "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails). Returns an "
         "empty list "
         "when unrestricted."
@@ -475,7 +567,9 @@ async def list_allowed_senders() -> PolicyDiscoveryResult:
     description=(
         "Send one email using the specified account. Supports reply threading. Partial or ambiguous SMTP "
         "delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy "
-        "outcome separately; ambiguous effects are not retried automatically."
+        "outcome separately; ambiguous effects are not retried automatically. The response names the delivered "
+        "message's RFC Message-Id once the provider accepts the message data, and reports no identifier for an "
+        "ambiguous delivery."
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -526,7 +620,7 @@ async def send_email(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Message-ID of the email being replied to. Enables proper threading in email clients.",
+            description="Message-ID of the email being replied to. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
         ),
     ] = None,
     references: Annotated[
@@ -534,7 +628,7 @@ async def send_email(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
+            description="Space-separated Message-IDs for the thread chain. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
     reply_to: Annotated[
@@ -563,16 +657,100 @@ async def send_email(
             )
         )
     except RecipientPolicyDeniedError as exc:
-        raise ValueError("Recipient(s) not in allowlist") from exc
-    if (
-        all(item.status == "succeeded" for item in outcome.delivery)
-        and outcome.sent_copy.status in ("succeeded", "skipped")
-        and not outcome.reconciliation_needed
-    ):
+        raise ValueError(
+            "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
+            "before sending or saving. An empty allowlist denies all recipients."
+        ) from exc
+    if _send_outcome_is_clean(outcome):
         recipient_str = ", ".join(recipients)
         attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
-        return f"Email sent successfully to {recipient_str}{attachment_info}"
+        return f"Email sent successfully to {recipient_str}{attachment_info}{_reported_message_id(outcome)}"
     return f"Email delivery [{_tagged_send_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Forward an existing message to new recipients using the specified account. The source message is read "
+        "over IMAP first: if it cannot be read, the call fails before any SMTP session is opened, so a forward is "
+        "never delivered without the content it was supposed to carry. The subject is derived from the source as "
+        "'Fwd: <original subject>' without stacking a second prefix, the caller's note is placed above a "
+        "plain-text forwarded block re-composed from the source's parsed text body, and the source's attachments "
+        "are re-attached with their original MIME types unless include_attachments is false. Partial or ambiguous "
+        "SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent "
+        "Sent-copy outcome separately; ambiguous effects are not retried automatically. The response names the "
+        "delivered message's RFC Message-Id once the provider accepts the message data, and reports no "
+        "identifier for an ambiguous delivery."
+    ),
+    annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
+)
+async def forward_email(
+    account_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.account_name_bytes,
+            description="The name of the email account to forward from.",
+        ),
+    ],
+    email_id: Annotated[UidInput, Field(description="UID of the source message to forward.")],
+    recipients: Annotated[
+        list[AddressInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.recipients,
+            description="A list of addresses that receive the forwarded message.",
+        ),
+    ],
+    source_mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The mailbox that contains the source message.",
+        ),
+    ] = "INBOX",
+    body: Annotated[
+        str,
+        Field(
+            default="",
+            max_length=APPLICATION_LIMITS.body_bytes,
+            description="An optional note placed above the forwarded content.",
+        ),
+    ] = "",
+    cc: Annotated[
+        list[AddressInput] | None,
+        Field(default=None, max_length=APPLICATION_LIMITS.recipients, description="A list of CC email addresses."),
+    ] = None,
+    bcc: Annotated[
+        list[AddressInput] | None,
+        Field(default=None, max_length=APPLICATION_LIMITS.recipients, description="A list of BCC email addresses."),
+    ] = None,
+    include_attachments: Annotated[
+        bool,
+        Field(default=True, description="Whether to re-attach the source message's attachments."),
+    ] = True,
+) -> str:
+    try:
+        outcome = await forward_email_command(
+            ForwardCommand(
+                account_name=account_name,
+                recipients=tuple(recipients),
+                subject="",
+                body=body,
+                cc=tuple(cc or ()),
+                bcc=tuple(bcc or ()),
+                source_email_id=email_id,
+                source_mailbox=source_mailbox,
+                include_attachments=include_attachments,
+            )
+        )
+    except RecipientPolicyDeniedError as exc:
+        raise ValueError(
+            "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
+            "before sending or saving. An empty allowlist denies all recipients."
+        ) from exc
+    if _send_outcome_is_clean(outcome):
+        return f"Email forwarded successfully to {', '.join(recipients)}{_reported_message_id(outcome)}"
+    return f"Email forward [{_tagged_send_result(outcome)}]"
 
 
 @mcp.tool(
@@ -635,7 +813,7 @@ async def save_to_mailbox(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Message-ID of the email being replied to. Enables proper threading in email clients.",
+            description="Message-ID of the email being replied to. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
         ),
     ] = None,
     references: Annotated[
@@ -643,7 +821,7 @@ async def save_to_mailbox(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Space-separated Message-IDs for the thread chain.",
+            description="Space-separated Message-IDs for the thread chain. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
         ),
     ] = None,
     flags: Annotated[
@@ -673,7 +851,10 @@ async def save_to_mailbox(
             )
         )
     except RecipientPolicyDeniedError as exc:
-        raise ValueError("Recipient(s) not in allowlist") from exc
+        raise ValueError(
+            "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
+            "before sending or saving. An empty allowlist denies all recipients."
+        ) from exc
     if outcome.status == "succeeded" and not outcome.reconciliation_needed:
         email_id = outcome.uid or "unknown"
         return f"Email saved to '{mailbox}' successfully. Message-Id: {outcome.message_id}, email_id: {email_id}"
@@ -767,6 +948,62 @@ async def set_email_flags(
         verb, preposition = ("added", "to") if operation == "add" else ("removed", "from")
         return f"Successfully {verb} {', '.join(flags)} {preposition} {len(succeeded)} email(s)"
     return f"Set-flags result [{_tagged_batch_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Add or remove configured writable semantic tags on emails. Only semantic names are accepted; "
+        "standard flags and unrelated provider keywords are preserved."
+    ),
+    annotations=_IDEMPOTENT_REMOTE_MUTATION,
+)
+async def set_email_tags(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    email_ids: Annotated[
+        list[UidInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.mutation_uids,
+            description="List of email_id values whose tags should be changed.",
+        ),
+    ],
+    operation: Annotated[
+        Literal["add", "remove"],
+        Field(description="Whether to add or remove every supplied semantic tag."),
+    ],
+    tags: Annotated[
+        list[FlagInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.flags,
+            description="Configured writable semantic tag names.",
+        ),
+    ],
+    mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The mailbox containing the emails.",
+        ),
+    ] = "INBOX",
+) -> str:
+    outcome = await set_email_tags_command(
+        SetEmailTagsCommand(
+            account_name=account_name,
+            email_ids=tuple(email_ids),
+            operation=operation,
+            tags=tuple(tags),
+            mailbox=mailbox,
+        )
+    )
+    succeeded = outcome.targets("succeeded")
+    if len(succeeded) == len(email_ids) and not outcome.reconciliation_needed:
+        action = "added" if operation == "add" else "removed"
+        return f"Successfully {action} configured tags on {len(succeeded)} email(s)"
+    return f"Set-tags result [{_tagged_batch_result(outcome)}]"
 
 
 @mcp.tool(
@@ -912,6 +1149,67 @@ async def list_mailboxes(
     return await list_mailboxes_query(
         ListMailboxesQuery(account_name=account_name, pattern=pattern, reference=reference)
     )
+
+
+@mcp.tool(
+    description=(
+        "Read one email attachment as an MCP embedded binary resource without writing a local file. "
+        "This independent transfer mode requires enable_attachment_content=true."
+    ),
+    annotations=_READ_ONLY_REMOTE,
+)
+async def get_attachment_content(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    email_id: Annotated[
+        UidInput,
+        Field(description="The email ID obtained from list_emails_metadata or get_emails_content."),
+    ],
+    attachment_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.attachment_path_bytes,
+            description="The attachment filename shown in the message's attachments list.",
+        ),
+    ],
+    mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The mailbox containing the email.",
+        ),
+    ] = "INBOX",
+) -> CallToolResult:
+    payload = await get_attachment_content_command(
+        DownloadAttachmentCommand(
+            account_name=account_name,
+            email_id=email_id,
+            attachment_name=attachment_name,
+            mailbox=mailbox,
+        )
+    )
+    uri = f"email-attachment://content/{secrets.token_urlsafe(18)}"
+    resource = BlobResourceContents.model_validate({
+        "uri": uri,
+        "mimeType": payload.mime_type,
+        "blob": base64.b64encode(payload.content).decode("ascii"),
+    })
+    embedded = EmbeddedResource.model_validate({
+        "type": "resource",
+        "resource": resource,
+        "_meta": {
+            "filename": payload.attachment_name,
+            "size": len(payload.content),
+        },
+    })
+    result = CallToolResult(content=[embedded])
+    try:
+        validate_serialized_result(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+    except ValueError:
+        raise ValueError("serialized attachment content exceeds the global result limit") from None
+    return result
 
 
 @mcp.tool(

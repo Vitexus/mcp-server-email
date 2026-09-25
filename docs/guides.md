@@ -47,8 +47,9 @@ Or configure one through environment variables without
 }
 ```
 
-`send_email` remains in the static MCP tool list, but calling it for this
-account fails its SMTP capability check before provider access. IMAP mutation
+`send_email` and `forward_email` remain in the static MCP tool list, but
+calling either for this account fails its SMTP capability check before provider
+access — for a forward, before the source message is read. IMAP mutation
 tools remain available, so this is not a strict read-only mode. To limit
 mutations, also constrain which MCP tools the client may call or run the server
 with an account whose provider permissions are read-only.
@@ -222,10 +223,46 @@ await send_email(
 ```
 
 `in_reply_to` and `references` are nullable because not every message belongs to
-a thread or has a valid Message-ID. The server returns `references` as one
+a thread or has a valid Message-ID. Simple Message-IDs may be supplied bare or
+inside angle brackets; the compose path adds missing brackets to each simple ID
+and preserves already bracketed values. The server returns `references` as one
 whitespace-normalized string rather than guessing how to tokenize malformed or
 historical header syntax. Treat both values as untrusted observations: compose
-validation rejects malformed values containing control characters.
+validation rejects malformed values containing control characters, and unusual
+legacy syntax is preserved rather than partially rewritten.
+
+## Forward a message with its attachments
+
+Locate the message with `list_emails_metadata`, then forward it by UID. The
+subject and the quoted content are derived from the source message, so the
+caller supplies only the note that goes above them:
+
+```python
+await forward_email(
+    account_name="work",
+    email_id="123",
+    source_mailbox="INBOX",
+    recipients=["alice@example.com"],
+    body="Forwarding this for your records; the signed contract is attached.",
+)
+```
+
+The delivered subject becomes `Fwd: <original subject>`, and the original's
+attachments are re-attached with their MIME types and parameters preserved. Pass
+`include_attachments=False` to forward only the text.
+
+The quoted block is rebuilt from the parsed plain-text body, so an HTML-heavy
+original arrives without its formatting. Nothing is silently truncated: the
+composed body, note included, is bounded at 1 MiB, and a forward that exceeds it
+is rejected rather than trimmed. When the recipient needs the message exactly as
+it was sent, save the parts with `download_attachment` and compose the message
+yourself with `send_email`.
+
+Forwarding requires SMTP, so it fails its capability check for an
+[IMAP-only account](#imap-only-accounts). If the source message cannot be read,
+including when a sender allowlist hides it, the call fails before any SMTP
+session is opened, so a forward is never sent without the attachments it was
+supposed to carry.
 
 ## Read a long message in chunks
 
@@ -250,6 +287,38 @@ second = await get_emails_content(
 
 Keep the mailbox argument consistent with the mailbox used to obtain the
 `email_id`.
+
+## Work with semantic email tags
+
+Start by calling `list_email_tags(account_name="work")`. A request such as
+“messages requiring an action” can then resolve to the configured `todo` name.
+Filter with `list_emails_metadata(semantic_tags=["todo"], tag_match="all")`.
+Add or remove the tag with
+`set_email_tags(email_ids=["123"], operation="add", tags=["todo"])` or
+`operation="remove"`. Tool inputs use semantic names only, and mutation requires
+the configured tag to have `writable=true`.
+
+## Return attachments to ChatGPT or another remote MCP app
+
+A remote ChatGPT app or custom MCP client does not share the server's filesystem.
+A path returned by `download_attachment` therefore remains a path on the machine
+running `mcp-email-server`; it is not an attachment the remote client can read.
+
+For that setup, expose the server through the HTTPS transport expected by the
+client, or through a trusted secure MCP tunnel, and explicitly enable attachment
+content transfer:
+
+```toml
+enable_attachment_content = true
+```
+
+In managed mode, enable **Allow attachments to be returned through MCP** in the
+local management UI instead. Then call `get_attachment_content` with the message
+ID and filename returned by `get_emails_content`. The tool returns the attachment
+as one embedded binary resource without creating a local file. This setting is
+independent of `enable_attachment_download`; enable only the mode your client
+uses. The complete encoded result must fit the server's existing global result
+ceiling.
 
 ## Import legacy accounts into a managed catalog
 

@@ -114,6 +114,13 @@ backups include plaintext `managed_secret.secret_value` values. Keep every copy
 under protection equivalent to the private original; do not upload, share, or
 treat it as a non-secret account database.
 
+The declared v3-to-v4 catalog migration runs only after the existing catalog and
+sidecars pass the same private-file checks as a normal managed open. One bounded
+SQLite write transaction validates the exact v3 schema, adds default-disabled
+attachment content and empty tag mappings, validates the resulting v4 schema and
+invariants, and records version 4 last. It neither selects nor copies secret
+values; failure rolls back without changing the advertised schema version.
+
 A create or rotation stores a new immutable value and commits it as active only
 if the reviewed account revision still matches. On Linux and Windows, inserting
 `managed_secret`, activating its binding, incrementing the binding/account
@@ -312,6 +319,24 @@ reader, directory listing, remote URL, or arbitrary path lookup is exposed by
 this feature. Only connect a local MCP client whose own filesystem tools may
 legitimately inspect paths returned by the server.
 
+## Semantic tags and embedded attachments
+
+Semantic tag mappings are non-secret account configuration, but their names and
+provider keywords can reveal mailbox organization. Legacy mode stores them with
+the account in the private TOML configuration; managed mode stores them with the
+account in the private catalog. Tag writes require `writable=true` and accept
+semantic names only. The workflow never modifies standard flags, read-only
+configured tags, or unrelated provider keywords.
+
+`get_attachment_content` does not create a local artifact, but it transfers the
+original decoded bytes through MCP and therefore exposes private message content
+to the connected MCP client. It has an independent
+`enable_attachment_content=true` policy and rechecks current authority after
+fetch. Enabling `download_attachment` does not enable content transfer. Use the
+content mode for a trusted remote client, such as a ChatGPT app, that cannot read
+server-local paths. The complete encoded tool result remains subject to the
+existing global serialized-result ceiling.
+
 ## Indexed metadata privacy
 
 The operational SQLite projection contains no message bodies, raw MIME,
@@ -402,6 +427,13 @@ container platform. If a literal secret must be stored in a client
 configuration, restrict that file to the account running the client and keep it
 out of version control and diagnostic output.
 
+The checked-in container build uses an allowlisted Docker context and copies only
+the non-editable installed environment into the runtime image. It does not embed
+repository `.env`, `config.toml`, database, source, test, or cache files. Keep
+credentials out of Docker build arguments and derived image layers; inject them
+only at runtime through a protected env file, secret provider, or private
+configuration mount.
+
 Neither MCP nor ordinary local-UI account forms read legacy environment secrets.
 Treat environment-composited accounts as runtime compatibility inputs and copy
 them only through the explicit, reviewed import flow; the environment value is
@@ -464,7 +496,8 @@ responsibility.
 ## Recipient allowlist
 
 Sending is disabled when the allowed-recipient collection is empty. Enable and
-restrict both `send_email` and `save_to_mailbox` by adding exact addresses:
+restrict `send_email`, `forward_email`, and `save_to_mailbox` by adding exact
+addresses or bare glob patterns:
 
 ```toml
 allowed_recipients = [
@@ -480,12 +513,44 @@ MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS='alice@example.com,bob@example.com'
 ```
 
 Every To, CC, and BCC address must be allowed. Matching is case-insensitive and
-understands display-name forms such as `Alice <alice@example.com>`.
+understands display-name forms such as `Alice <alice@example.com>`. Patterns
+match the entire extracted address, not the display name, using the same glob
+syntax as sender policy: `*`, `?`, and bracket expressions such as `[0-9]`.
+For example, `*@example.com` permits that domain, not `example.com.evil`.
+
+To explicitly allow dynamic recipients, configure:
+
+```toml
+allowed_recipients = ["*"]
+```
+
+`["*@*"]` also allows all valid recipients. **This permits unrestricted sending,
+forwarding, and recipient-bound draft saves**, not just drafts. It does not
+bypass address validation, account capabilities, or other policies. Prefer a
+narrow domain pattern when possible; there is no separate draft-only allowlist.
 
 `list_allowed_recipients` is always visible in the static MCP tool catalog. An
 empty result means sending is disabled; it never means unrestricted sending.
 The Web UI edits recipients as individual add/edit/remove items and states this
-empty behavior explicitly.
+empty behavior explicitly. The restriction applies equally in managed and
+legacy mode and covers To, CC, and BCC. An initially empty policy is rejected
+before a provider is opened, including before a forward source is read.
+Clearing the last recipient does not enable unrestricted sending. This policy
+is not a read-only mode: other mailbox mutations remain available.
+
+### Recipient policy upgrade note
+
+Earlier implementations incorrectly permitted any recipient when this list was
+empty, despite the documented restriction and UI guidance. The fix for
+[#247](https://github.com/Wh1isper/mcp-email-server/issues/247) changes that
+behavior: an empty list now denies `send_email`, `forward_email`, and
+`save_to_mailbox`. This is a compatibility change in both managed and legacy
+mode. Before upgrading a workflow that relied on unrestricted recipients,
+configure its intended addresses or patterns explicitly. Use `"*"` only if you
+intend to allow every recipient for all three operations; there is no automatic
+unrestricted fallback. Existing entries containing glob syntax now act as
+patterns rather than literal addresses, so review them when upgrading. See
+[recipient-policy troubleshooting](troubleshooting.md#recipient-allowlist-errors).
 
 ## Sender allowlist
 
@@ -513,6 +578,9 @@ The allowlist protects:
 - Metadata listing and pagination.
 - Body retrieval and optional read marking.
 - Attachment download.
+- The `forward_email` source read and SMTP handoff. A blocked source is
+  indistinguishable from a missing message, and a sender policy tightened after
+  the read is rechecked before SMTP, so a forward never reveals or delivers it.
 - Deletion and approved flag/read-state mutations.
 - Move and archive operations.
 
