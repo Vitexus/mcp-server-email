@@ -23,14 +23,13 @@ properties([
 ])
 node() {
     ansiColor('xterm') {
-        stage('SCM Checkout') {
-            sh 'sudo chown -R jenkins:jenkins . 2>/dev/null || true'
-            checkout scm
-            // Checked out once here; every parallel branch below unstashes
-            // this instead of hitting GitHub again, so a wide build matrix
-            // costs one clone instead of one per branch.
-            stash name: 'src', useDefaultExcludes: false
-        }
+stage('SCM Checkout') {
+    checkout scm
+
+    stash name: 'src',
+          includes: '**/*',
+          excludes: '.git/**,.claude/**'
+}        
     }
 }
 
@@ -49,11 +48,22 @@ distributions.each { distro ->
 
         node {
             ansiColor('xterm') {
-                stage('Checkout ' + distroName) {
-                    sh 'sudo chown -R jenkins:jenkins . 2>/dev/null || true'
-                    unstash 'src'
-                    buildImage = docker.image(vendor + '/' + distro)
-                }
+
+stage('Checkout ' + distroName) {
+    unstash 'src'
+
+    def imageName = vendor + '/' + distro
+    buildImage = docker.image(imageName)
+
+    def version = sh(
+        script: 'dpkg-parsechangelog --show-field Version',
+        returnStdout: true
+    ).trim()
+
+    buildVer = version + '.' + env.BUILD_NUMBER + '~' + distroCode
+}
+
+
                 stage('Build ' + distroName) {
                     buildImage.inside {
                         // Git operations run inside the container to avoid index.lock conflicts
