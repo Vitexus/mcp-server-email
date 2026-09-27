@@ -12,6 +12,24 @@ String[] distributions = [
 String vendor = 'vitexsoftware'
 //String distroFamily = ''
 
+// Ensure repo.vitexsoftware.com exposes the Aptly "backports" component.
+// publishDebToAptly routes override packages there (see backportsPkgs in
+// DebianRepository/vars/publishDebToAptly.groovy). Runtime deps of this
+// package — notably python3-starlette and python3-jsonschema via
+// python3-mcp — exist only in that component, not in Debian/Ubuntu main.
+def ensureVitexBackports = '''
+    set -eu
+    list=/etc/apt/sources.list.d/vitexsoftware.list
+    if [ -f "$list" ] && grep -q repo.vitexsoftware "$list"; then
+        if ! grep -Eq '(^|[[:space:]])backports([[:space:]]|$)' "$list"; then
+            sudo sed -i -E 's/([[:space:]]main)([[:space:]]|$)/\\1 backports\\2/' "$list"
+        fi
+        echo "VitexSoftware APT sources:"; cat "$list"
+    else
+        echo "WARNING: $list missing or has no repo.vitexsoftware entry" >&2
+    fi
+'''
+
 properties([
     copyArtifactPermission('*'),
     buildBlocker(
@@ -84,6 +102,7 @@ stage('Checkout ' + distroName) {
                         withEnv(["BUILDVER=${buildVer}"]) {
                             sh 'dch -b -v "$BUILDVER" "$BUILD_TAG"'
                         }
+                        sh ensureVitexBackports
                         sh 'sudo apt-get update --allow-releaseinfo-change'
                         sh 'sudo chown jenkins:jenkins ..'
                         sh 'sudo rm -rf debian/$(dpkg-parsechangelog --show-field Source)/ debian/.debhelper/ debian/tmp/'
@@ -113,6 +132,7 @@ stage('Checkout ' + distroName) {
                         def debconf_debug = 0 //Set to "5" or "developer" to debug debconf
                         sh 'cd $WORKSPACE/dist/debian/ ; dpkg-scanpackages . /dev/null > Packages; gzip -9c Packages > Packages.gz; cd $WORKSPACE'
                         sh 'echo "deb [trusted=yes] file://///$WORKSPACE/dist/debian/ ./" | sudo tee /etc/apt/sources.list.d/local.list'
+                        sh ensureVitexBackports
                         sh 'sudo apt-get update --allow-releaseinfo-change'
                         sh 'echo "INSTALATION"'
 
