@@ -1,3 +1,13 @@
+mcp-server-email (1.1.2-2) unstable; urgency=medium
+
+  * Refresh 0001-mcp-sdk-2.0-compat.patch: it no longer applied to the
+    1.1.2 sources, so published builds shipped the unpatched
+    mcp.server.fastmcp import and crashed on startup with python3-mcp 2.x.
+  * Patch the streamable-http/sse transports, which used the removed
+    mcp.settings object.
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Wed, 30 Sep 2026 09:00:00 +0200
+
 mcp-server-email (1.1.2-1) unstable; urgency=medium
 
   * Align Source name with package: python-mcp-email-server →

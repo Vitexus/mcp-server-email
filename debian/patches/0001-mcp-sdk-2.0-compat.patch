@@ -12,23 +12,29 @@ Description: Port from MCP SDK 1.x to 2.0.0
     pydantic model with .model_validate_json(); use the module-level
     mcp.types.jsonrpc_message_adapter (a pydantic TypeAdapter) instead.
  .
+  * The HTTP/SSE transports: FastMCP 1.x mcp.settings.{host,port,
+    transport_security} is gone; pass them to run() instead.
+ .
  Verified against python3-mcp 1:2.0.0-1.7~trixie: a real MCP ClientSession
  completes initialize() and tools/list() through this patched build.
 Author: Vítězslav Dvořák <info@vitexsoftware.cz>
 Forwarded: not-needed
-Last-Update: 2026-07-31
+Last-Update: 2026-09-30
+
+diff --git a/mcp_email_server/app.py b/mcp_email_server/app.py
+index 3e2de5a..d529eb5 100644
 --- a/mcp_email_server/app.py
 +++ b/mcp_email_server/app.py
-@@ -5,7 +5,7 @@ from importlib.metadata import version
+@@ -7,7 +7,7 @@ from importlib.metadata import version
  from typing import Annotated, Literal
  
  import anyio
 -from mcp.server.fastmcp import FastMCP
 +from mcp.server.mcpserver import MCPServer as FastMCP
- from mcp.types import ToolAnnotations
+ from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, ToolAnnotations
  from pydantic import Field
  
-@@ -160,9 +160,7 @@ async def _application_lifespan(_server: FastMCP) -> AsyncIterator[dict[str, obj
+@@ -236,9 +236,7 @@ async def _application_lifespan(_server: FastMCP) -> AsyncIterator[dict[str, obj
              await close_application_runtime()
  
  
@@ -39,6 +45,47 @@ Last-Update: 2026-07-31
  
  _READ_ONLY_LOCAL = ToolAnnotations(
      readOnlyHint=True,
+diff --git a/mcp_email_server/cli.py b/mcp_email_server/cli.py
+index f283f8b..35cd7e1 100644
+--- a/mcp_email_server/cli.py
++++ b/mcp_email_server/cli.py
+@@ -177,10 +177,12 @@ def _build_transport_security_settings(host: str, port: int) -> TransportSecurit
+     )
+ 
+ 
+-def _configure_http_transport(host: str, port: int) -> None:
+-    mcp.settings.host = host
+-    mcp.settings.port = port
+-    mcp.settings.transport_security = _build_transport_security_settings(host, port)
++def _http_transport_kwargs(host: str, port: int) -> dict[str, object]:
++    return {
++        "host": host,
++        "port": port,
++        "transport_security": _build_transport_security_settings(host, port),
++    }
+ 
+ 
+ def _json_requested() -> bool:
+@@ -1290,8 +1292,7 @@ def sse(
+ ) -> None:
+     """Run the compatibility SSE transport with explicit HTTP trust boundaries."""
+     _validate_managed_runtime()
+-    _configure_http_transport(host, port)
+-    mcp.run(transport="sse")
++    mcp.run(transport="sse", **_http_transport_kwargs(host, port))
+ 
+ 
+ @app.command()
+@@ -1307,8 +1308,7 @@ def streamable_http(
+ ) -> None:
+     """Run the compatibility Streamable HTTP transport with explicit trust boundaries."""
+     _validate_managed_runtime()
+-    _configure_http_transport(host, port)
+-    mcp.run(transport="streamable-http")
++    mcp.run(transport="streamable-http", **_http_transport_kwargs(host, port))
+ 
+ 
+ @app.command()
 diff --git a/mcp_email_server/stdio.py b/mcp_email_server/stdio.py
 index dd5a9cf..027e6d3 100644
 --- a/mcp_email_server/stdio.py
