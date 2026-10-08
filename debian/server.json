@@ -1,0 +1,197 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "cz.vitexsoftware/mcp-server-email",
+  "description": "MCP server for reading and sending e-mail over IMAP/SMTP.",
+  "environmentVariables": [
+    {
+      "name": "MCP_EMAIL_SERVER_EMAIL_ADDRESS",
+      "description": "E-mail address of the mailbox (single-account environment mode).",
+      "isRequired": true
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_PASSWORD",
+      "description": "Mailbox password, used for IMAP and SMTP unless overridden below.",
+      "isRequired": true,
+      "isSecret": true
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_HOST",
+      "description": "IMAP server host name.",
+      "isRequired": true
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_PORT",
+      "description": "IMAP server port.",
+      "default": "993"
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_SSL",
+      "description": "Use implicit TLS for IMAP.",
+      "default": "true",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_START_SSL",
+      "description": "Use STARTTLS for IMAP.",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_VERIFY_SSL",
+      "description": "Verify the IMAP server certificate.",
+      "default": "true",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_USER_NAME",
+      "description": "IMAP login if different from USER_NAME."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_IMAP_PASSWORD",
+      "description": "IMAP password if different from PASSWORD.",
+      "isSecret": true
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_HOST",
+      "description": "SMTP server host name. Leave empty for a read-only mailbox: sending is enabled only when this is set."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_PORT",
+      "description": "SMTP server port.",
+      "default": "465"
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_SSL",
+      "description": "Use implicit TLS for SMTP.",
+      "default": "true",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_START_SSL",
+      "description": "Use STARTTLS for SMTP.",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_VERIFY_SSL",
+      "description": "Verify the SMTP server certificate.",
+      "default": "true",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_USER_NAME",
+      "description": "SMTP login if different from USER_NAME."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SMTP_PASSWORD",
+      "description": "SMTP password if different from PASSWORD.",
+      "isSecret": true
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_USER_NAME",
+      "description": "Login name; defaults to the e-mail address."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_FULL_NAME",
+      "description": "Display name used in the From header; defaults to the part before @."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_ACCOUNT_NAME",
+      "description": "Account name shown to MCP clients.",
+      "default": "default"
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SAVE_TO_SENT",
+      "description": "Save a copy of sent messages to the Sent folder.",
+      "default": "true",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_SENT_FOLDER_NAME",
+      "description": "Sent folder name; auto-detected when empty."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS",
+      "description": "Comma-separated recipient patterns the server may send to; sending is blocked for others."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_ALLOWED_SENDERS",
+      "description": "Comma-separated sender patterns the server may read messages from."
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD",
+      "description": "Allow downloading attachments to disk.",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT",
+      "description": "Allow returning attachment content to the client.",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS",
+      "description": "Report blocked send/modify attempts instead of failing silently.",
+      "default": "false",
+      "choices": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_CONFIG_PATH",
+      "description": "Path of the TOML configuration / managed account catalog bootstrap.",
+      "default": "~/.config/mcp-email-server/config.toml"
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE",
+      "description": "Where account passwords are stored.",
+      "choices": [
+        "auto",
+        "keyring",
+        "plaintext"
+      ],
+      "isSecret": false
+    },
+    {
+      "name": "MCP_EMAIL_SERVER_LOG_LEVEL",
+      "description": "Log verbosity.",
+      "default": "INFO",
+      "choices": [
+        "TRACE",
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR"
+      ]
+    }
+  ]
+}
