@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, KeyRound, Mail, MoreHorizontal, Pause, Pencil, Play, Plus, RefreshCw, Trash2, Wrench } from 'lucide-react'
 
 import { ApiError, type ManagementApi } from '../api'
-import type { AccountDetails, AccountInput, AccountSummary, AccountTag, BindingState, CatalogTarget, Endpoint, ManagementStatus } from '../types'
+import type { AccountDetails, AccountInput, AccountSummary, AccountTag, BindingState, CatalogTarget, Endpoint, ManagementStatus, MutationClass } from '../types'
 import { ConflictNotice, errorMessage, StatusMessage } from './Feedback'
 import { CredentialsPanel } from './CredentialsPanel'
+import { ALL_MUTATIONS, grantSummary, MutationGrants } from './MutationGrants'
 
 const blankEndpoint = (port: number): Endpoint => ({
   host: '',
@@ -88,6 +89,9 @@ const displayNameFromEmail = (emailAddress: string): string => {
 }
 
 const blankAccount = (): AccountInput => ({
+  allowed_mutations: null,
+  drafts_mailbox: null,
+  allow_protocol_commands: false,
   name: '',
   full_name: '',
   email_address: '',
@@ -99,6 +103,9 @@ const blankAccount = (): AccountInput => ({
 })
 
 const editableAccount = (current: AccountDetails): AccountInput => ({
+  allowed_mutations: current.allowed_mutations ?? null,
+  drafts_mailbox: current.drafts_mailbox ?? null,
+  allow_protocol_commands: current.allow_protocol_commands ?? false,
   name: current.name,
   full_name: current.full_name,
   email_address: current.email_address,
@@ -206,6 +213,7 @@ function AccountEditor({
   api,
   current,
   catalogRevision,
+  globalGrants,
   target,
   onSaved,
   onCancel,
@@ -213,6 +221,7 @@ function AccountEditor({
   api: ManagementApi
   current: AccountDetails | null
   catalogRevision: number
+  globalGrants: MutationClass[]
   target: CatalogTarget
   onSaved: (message: string) => Promise<void>
   onCancel: () => void
@@ -347,6 +356,19 @@ function AccountEditor({
           )}
       </div>
 
+      <details className="setup-details" open={editing}>
+        <summary>Account permissions</summary>
+        <div className="details-body">
+          <label className="field-checkbox"><input type="checkbox" checked={input.allowed_mutations == null} onChange={(event) => update('allowed_mutations', event.target.checked ? null : [...globalGrants])} /> Inherit global mutation grants</label>
+          <p className="hint">Permission source: {input.allowed_mutations == null ? 'Inherited from global policy' : 'Account override (replaces global grants)'}.</p>
+          <label className="field-checkbox"><input type="checkbox" checked={input.allow_protocol_commands ?? false} onChange={(event) => update('allow_protocol_commands', event.target.checked)} /> Allow advanced protocol commands</label>
+          <p className="hint">Allows raw mailbox deletion, expunge and arbitrary flags or keywords, without focused-tool safeguards. IMAP requires organize/delete/append grants, unrestricted senders and attachment-content access. SMTP requires send permission and an explicit * recipient policy. Disabled by default; never inherited.</p>
+          <MutationGrants id="account-grants" value={input.allowed_mutations ?? globalGrants} disabled={input.allowed_mutations == null} onChange={(grants) => update('allowed_mutations', grants)} />
+          <p className="hint">Effective permissions: {grantSummary(input.allowed_mutations ?? globalGrants)}.</p>
+          <div className="field"><label htmlFor="drafts-mailbox">Drafts mailbox (optional)</label><input id="drafts-mailbox" value={input.drafts_mailbox ?? ''} onChange={(event) => update('drafts_mailbox', event.target.value || null)} maxLength={1000} /><small>Mailbox used by save_draft. Leave empty to discover a unique provider Drafts special-use mailbox; this does not grant draft permission.</small></div>
+        </div>
+      </details>
+
       <details ref={setupDetailsRef} className="setup-details" open={editing}>
         <summary>Advanced account settings</summary>
         <div className="details-body">
@@ -399,8 +421,10 @@ function AccountEditor({
 }
 
 export function AccountsPanel({ api, target, onChanged }: { api: ManagementApi; target: CatalogTarget; onChanged?: () => void }) {
+  const [globalGrants, setGlobalGrants] = useState<MutationClass[]>(ALL_MUTATIONS)
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [catalogRevision, setCatalogRevision] = useState(0)
+  const [loaded, setLoaded] = useState(false)
   const [cleanupRequired, setCleanupRequired] = useState(0)
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [editor, setEditor] = useState<'new' | AccountDetails | null>(null)
@@ -417,12 +441,15 @@ export function AccountsPanel({ api, target, onChanged }: { api: ManagementApi; 
       const statusBefore = await api.status()
       if (!matchesTarget(statusBefore, target)) throw new Error('The selected account storage changed. Refresh status before continuing.')
       const accountResult = await api.accounts()
+      const policy = await api.policy()
       const statusAfter = await api.status()
       if (!matchesTarget(statusAfter, target)) throw new Error('The selected account storage changed while accounts were loading.')
       setAccounts(accountResult)
+      setGlobalGrants(policy.allowed_mutations)
       setCatalogRevision(statusAfter.report?.catalog_revision ?? 0)
       setCleanupRequired(statusAfter.report?.cleanup_required_bindings ?? 0)
       setRefreshFailed(false)
+      setLoaded(true)
       setError(null)
       return true
     } catch (caught) {
@@ -511,13 +538,17 @@ export function AccountsPanel({ api, target, onChanged }: { api: ManagementApi; 
     )
   }
 
+  if (!loaded && !refreshFailed) {
+    return <section aria-label="Email accounts"><p role="status">Loading email accounts…</p></section>
+  }
+
   if (editor) {
-    return <section aria-label="Email account editor"><AccountEditor api={api} current={editor === 'new' ? null : editor} catalogRevision={catalogRevision} target={target} onCancel={() => setEditor(null)} onSaved={async (message) => { const refreshed = await reloadAll(); setEditor(null); if (refreshed) setNotice(message) }} /></section>
+    return <section aria-label="Email account editor"><AccountEditor api={api} current={editor === 'new' ? null : editor} catalogRevision={catalogRevision} globalGrants={globalGrants} target={target} onCancel={() => setEditor(null)} onSaved={async (message) => { const refreshed = await reloadAll(); setEditor(null); if (refreshed) setNotice(message) }} /></section>
   }
 
   return (
     <section aria-labelledby="accounts-heading">
-      <div className="section-heading page-heading"><div><h1 id="accounts-heading">Email accounts</h1><p className="lede">Add an inbox or update its account and password settings.</p></div>{accounts.length ? <button type="button" className="with-icon" onClick={() => setEditor('new')}><Plus size={17} aria-hidden="true" />Add email account</button> : null}</div>
+      <div className="section-heading page-heading"><div><h1 id="accounts-heading">Email accounts</h1><p className="lede">Add an inbox or update its account and password settings.</p></div>{accounts.length ? <button type="button" className="with-icon" disabled={!loaded} onClick={() => setEditor('new')}><Plus size={17} aria-hidden="true" />Add email account</button> : null}</div>
       <StatusMessage message={notice} />
       {error && !(error instanceof Error && error.name === 'RevisionConflictError') ? <StatusMessage message={errorMessage(error)} error /> : null}
       <ConflictNotice error={error} onDismiss={() => setError(null)} />
@@ -529,7 +560,7 @@ export function AccountsPanel({ api, target, onChanged }: { api: ManagementApi; 
         </div>
       ) : null}
       {accounts.length === 0 ? (
-        <div className="empty account-empty"><div className="empty-mark" aria-hidden="true"><Mail size={22} /></div><h2>No email accounts yet</h2><p>Start with your email address and password. Connection settings are filled in automatically and remain editable.</p><button type="button" className="with-icon" onClick={() => setEditor('new')}><Plus size={17} aria-hidden="true" />Add your first account</button></div>
+        <div className="empty account-empty"><div className="empty-mark" aria-hidden="true"><Mail size={22} /></div><h2>No email accounts yet</h2><p>Start with your email address and password. Connection settings are filled in automatically and remain editable.</p><button type="button" className="with-icon" disabled={!loaded} onClick={() => setEditor('new')}><Plus size={17} aria-hidden="true" />Add your first account</button></div>
       ) : (
         <div className="account-list">
           {accounts.map((account) => {

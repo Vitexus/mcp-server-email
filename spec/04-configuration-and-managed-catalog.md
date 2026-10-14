@@ -115,6 +115,34 @@ provider authentication, timeout, and transport failures retain their category.
 Endpoint port range and mutually exclusive implicit-TLS/STARTTLS modes are
 validated before CLI secret collection and again at the application boundary.
 
+## Explicit Protocol Command Access
+
+Each email account has `allow_protocol_commands: bool`, default false and never
+inherited from global mutation grants. Only user-operated configuration, CLI,
+or UI can set it; the MCP request cannot enable or override it. Persist and
+round-trip it through legacy configuration, managed accounts, import, and
+non-secret management DTOs. Existing accounts migrate with access disabled.
+
+Execution additionally requires current compatible effective policy:
+
+- IMAP: an incoming endpoint, organize/delete/append grants, no sender allowlist,
+  and attachment-content access enabled.
+- SMTP: an outgoing endpoint, send grant, and an explicit universal `*` recipient
+  pattern. An empty recipient allowlist denies rather than allows sending.
+
+An incompatible profile is rejected as a whole, even for an individually benign
+command. Never broaden settings automatically. Existing focused tools remain
+available under their normal fine-grained grants. Account disable/removal,
+endpoint/credential identity changes, and policy revocation stop further commands
+on an established connection. Resolve only the selected protocol's secret.
+
+Enabling the flag explicitly authorizes wider server-side protocol semantics,
+including mailbox deletion/expunge and arbitrary flag/keyword changes without
+semantic-tag restrictions. Explain this in CLI/UI and published security docs;
+this is not the same promise as using the existing focused tools. It does not
+authorize local files, host programs, credential management, or other endpoints.
+Spec 10 owns the MCP surface and spec 07 owns provider execution.
+
 ## Low-level Agent Management CLI
 
 The `config` and `account` command groups are the low-level agent management API.
@@ -169,6 +197,34 @@ least:
 - relevant request/result limits where configurable;
 - sent-copy behavior and safe fallback choices.
 
+### Mutation grants and draft destination
+
+`allowed_mutations` is a list drawn from exactly `draft`, `organize`, `delete`,
+`send`, and `append`. Catalog/global defaults and legacy global settings default
+to all five classes, for both new and existing configurations that omit the
+field. This preserves read/write behavior; omission is not a deny default.
+An account override of `None`/omitted inherits the global list. An explicit
+account list replaces it, never unions with it; `[]` means read-only. An empty
+global list likewise denies mutations for inheriting accounts. Unknown classes
+are invalid. This policy is independent of endpoint capability and recipient,
+sender, attachment, and lifecycle constraints: a grant does not waive them.
+The effect-to-class mapping and Sent-copy exception are owned by spec 07.
+Legacy environment composition accepts global `MCP_EMAIL_SERVER_ALLOWED_MUTATIONS`
+and environment-account `MCP_EMAIL_SERVER_ACCOUNT_ALLOWED_MUTATIONS` as CSV
+lists, including empty for no grants. The latter applies only to the account
+created/replaced by the environment; omission inherits. `inherit` is a CLI
+sentinel, not an environment grant. `MCP_EMAIL_SERVER_DRAFTS_MAILBOX` sets that
+environment account's exact draft destination; omission selects discovery.
+These overlays do not override managed catalog authority.
+
+`drafts_mailbox` is an optional non-secret account field in managed and legacy
+configuration. When present it names the existing draft mailbox exactly; when
+absent, `save_draft` resolves the unique mailbox advertising the special-use
+`\Drafts` attribute. There is no name guessing, mailbox creation, or arbitrary
+MCP destination parameter for this tool. Missing or ambiguous discovery fails
+with guidance to configure `drafts_mailbox`. The management UI and CLI expose
+these fields without adding a mail composer or mutation route.
+
 Policy updates are revisioned. Recipient entries accept exact addresses (with
 legacy display-name extraction) or bare glob patterns, preserving glob syntax.
 Both are trimmed, lowercased, empty-filtered, and stably deduplicated; sender glob patterns are
@@ -183,8 +239,12 @@ case-insensitive whole-address glob match (`*`, `?`, and bracket expressions,
 as for sender policy). A literal `*` or `*@*` explicitly permits all valid
 recipients for all three operations, not just drafts; no implicit unrestricted
 mode exists. Patterns apply to the extracted address, never the display name.
-An initially empty recipient policy is rejected before opening a provider,
-including before a forward source is read. Permissive changes do not bypass
+An initially empty recipient policy is rejected for recipient-bearing compose
+requests before opening a provider,
+including before a forward source is read. `save_draft` also permits an explicit
+recipientless draft: no To, CC, or BCC addresses means no recipient match is
+required, even with an empty allowlist. Any supplied recipient must match the
+same policy; recipientless permission is not permission to send. Permissive changes do not bypass
 capability or input validation. Restrictive changes take effect on the next
 independent effect because authority is revalidated at operation boundaries.
 
@@ -355,6 +415,18 @@ provider connectivity. Results expose categories and remediation, never values,
 SQL, raw provider responses, or reusable locators.
 
 ## Acceptance Criteria
+
+- **04-P1:** Protocol access defaults off and survives TOML/environment composition, legacy
+  import, managed migration, CLI and UI create/update/readback. Omitted partial
+  updates preserve it; explicit false revokes it. Admission rejects incompatible
+  filters/grants before secret lookup, with no automatic policy broadening.
+
+- Omitted mutation settings preserve all five grants for new and old managed and
+  legacy configurations; account null/omission inherits, explicit lists replace,
+  and explicit empty lists are read-only. Persistence/import and CLI/UI preserve
+  this distinction and reject unknown classes.
+- Account draft destinations round-trip in managed and legacy mode; recipientless
+  `save_draft` and recipient-bearing allowlist enforcement remain distinct.
 
 1. Missing bootstrap retains only the historical implicit-legacy rule; explicit
    managed selection fails closed with no fallback.

@@ -4,12 +4,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from importlib.metadata import version
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import anyio
 from mcp.server.fastmcp import FastMCP
-from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, ToolAnnotations
-from pydantic import Field
+from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent, ToolAnnotations
+from pydantic import Field, ValidationError
 
 from mcp_email_server.application.accounts import AvailableAccount, EffectiveConfiguration
 from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_serialized_result
@@ -20,19 +20,32 @@ from mcp_email_server.application.mutations import (
     ArchiveCommand,
     ArchiveMutationOutcome,
     BatchMutationOutcome,
+    CreateMailboxCommand,
+    CreateMailboxOutcome,
     DeleteCommand,
     FlagOperation,
     ForwardCommand,
     MarkReadCommand,
     MoveCommand,
+    MoveMutationOutcome,
     MutableEmailFlag,
     RecipientPolicyDeniedError,
+    SaveDraftCommand,
     SaveToMailboxCommand,
     SendCommand,
     SendMutationOutcome,
     SetEmailFlagsCommand,
     SetEmailTagsCommand,
     TargetMutationOutcome,
+)
+from mcp_email_server.application.protocol import (
+    ProtocolCommand,
+    ProtocolFailure,
+    ProtocolRequest,
+    ProtocolResult,
+    ProtocolStep,
+    local_help,
+    parse_commands,
 )
 from mcp_email_server.application.reads import (
     DownloadAttachmentCommand,
@@ -41,6 +54,7 @@ from mcp_email_server.application.reads import (
 )
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
+    CreateMailboxResult,
     EmailContentBatchResponse,
     EmailMetadataPageResponse,
     MailboxInfo,
@@ -99,12 +113,16 @@ async def mark_read_command(command: MarkReadCommand) -> BatchMutationOutcome:
     return await get_application_runtime().mutations.mark_read.execute(command)
 
 
-async def move_emails_command(command: MoveCommand) -> BatchMutationOutcome:
+async def move_emails_command(command: MoveCommand) -> MoveMutationOutcome:
     return await get_application_runtime().mutations.move.execute(command)
 
 
 async def archive_emails_command(command: ArchiveCommand) -> ArchiveMutationOutcome:
     return await get_application_runtime().mutations.archive.execute(command)
+
+
+async def create_mailbox_command(command: CreateMailboxCommand) -> CreateMailboxOutcome:
+    return await get_application_runtime().mutations.create_mailbox.execute(command)
 
 
 async def get_email_content_query(query: GetEmailContentQuery) -> EmailContentBatchResponse:
@@ -236,7 +254,59 @@ async def _application_lifespan(_server: FastMCP) -> AsyncIterator[dict[str, obj
             await close_application_runtime()
 
 
-mcp = FastMCP("email", lifespan=_application_lifespan)
+def _protocol_tool_result(result: ProtocolResult) -> CallToolResult:
+    return CallToolResult(
+        isError=result.status != "completed",
+        content=[TextContent(type="text", text=result.model_dump_json())],
+        structuredContent=result.model_dump(mode="json"),
+    )
+
+
+async def _execute_protocol_request(request: ProtocolRequest) -> CallToolResult:
+    try:
+        parsed = parse_commands(request)
+        if parsed[0].name == "HELP":
+            return _protocol_tool_result(local_help(request.protocol, parsed[0]))
+    except (ProtocolFailure, UnicodeError) as exc:
+        return _protocol_tool_result(
+            ProtocolResult(
+                results=[ProtocolStep(index=index) for index in range(len(request.commands))],
+                error=str(exc) if isinstance(exc, ProtocolFailure) else "invalid_input: invalid Unicode",
+            )
+        )
+    service = get_application_runtime().protocol_commands
+    if service is None:
+        return _protocol_tool_result(ProtocolResult(error="protocol_unavailable: execution service is unavailable"))
+    return _protocol_tool_result(await service.execute(request))
+
+
+class EmailMCP(FastMCP):
+    """Keep legacy coercion unchanged; raw protocol input must be lossless and strict."""
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        for tool in tools:
+            if tool.name == "email_command":
+                tool.inputSchema = ProtocolRequest.model_json_schema()
+                tool.outputSchema = ProtocolResult.model_json_schema()
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):  # pyright: ignore[reportIncompatibleMethodOverride] - MCP supports CallToolResult, SDK annotation omits it
+        if name != "email_command":
+            return await super().call_tool(name, arguments)
+        try:
+            request = ProtocolRequest.model_validate(arguments)
+        except ValidationError:
+            # SDK validation errors include original input. Never echo message data.
+            return _protocol_tool_result(
+                ProtocolResult(
+                    error='invalid_input: use the email_command schema; call commands=[{"command":"HELP"}] for examples'
+                )
+            )
+        return await _execute_protocol_request(request)
+
+
+mcp = EmailMCP("email", lifespan=_application_lifespan)
 # FastMCP 1.x does not expose its low-level server version in the constructor.
 mcp._mcp_server.version = version("mcp-email-server")  # pyright: ignore[reportPrivateUsage]
 
@@ -864,6 +934,85 @@ async def save_to_mailbox(
 
 
 @mcp.tool(
+    description="Compose and save an unsent draft to the configured drafts mailbox or unique special-use Drafts mailbox. Requires draft permission, not append or send. Recipients may be omitted; supplied recipients obey the recipient allowlist. The Draft flag is fixed; no arbitrary target or flags.",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+)
+async def save_draft(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    subject: Annotated[
+        str,
+        Field(max_length=APPLICATION_LIMITS.subject_bytes, description="The subject of the email."),
+    ],
+    body: Annotated[
+        str,
+        Field(max_length=APPLICATION_LIMITS.body_bytes, description="The body of the email."),
+    ],
+    recipients: Annotated[
+        list[AddressInput] | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.recipients,
+            description="Optional draft recipients; supplied addresses obey the recipient allowlist.",
+        ),
+    ] = None,
+    cc: Annotated[
+        list[AddressInput] | None,
+        Field(default=None, max_length=APPLICATION_LIMITS.recipients, description="A list of CC email addresses."),
+    ] = None,
+    bcc: Annotated[
+        list[AddressInput] | None,
+        Field(default=None, max_length=APPLICATION_LIMITS.recipients, description="A list of BCC email addresses."),
+    ] = None,
+    html: Annotated[
+        bool,
+        Field(default=False, description="Whether the email body is HTML (True) or plain text (False)."),
+    ] = False,
+    attachments: Annotated[
+        list[AttachmentPathInput] | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.attachments,
+            description="A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+        ),
+    ] = None,
+    in_reply_to: Annotated[
+        str | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.header_bytes,
+            description="Message-ID of the email being replied to. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
+        ),
+    ] = None,
+    references: Annotated[
+        str | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.header_bytes,
+            description="Space-separated Message-IDs for the thread chain. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
+        ),
+    ] = None,
+) -> str:
+    outcome = await get_application_runtime().mutations.save_draft.execute(
+        SaveDraftCommand(
+            account_name=account_name,
+            recipients=tuple(recipients or ()),
+            subject=subject,
+            body=body,
+            cc=tuple(cc or ()),
+            bcc=tuple(bcc or ()),
+            html=html,
+            attachments=tuple(attachments or ()),
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+    )
+    warning = "; warning: reconciliation needed" if outcome.reconciliation_needed else ""
+    return f"Draft save [{outcome.status}: {outcome.mailbox}; Message-Id: {outcome.message_id}{warning}]"
+
+
+@mcp.tool(
     description=(
         "Delete one or more emails by email_id using target-scoped UID EXPUNGE. Use list_emails_metadata first. "
         "Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically."
@@ -1044,8 +1193,12 @@ async def mark_emails_as_read(
 
 @mcp.tool(
     description=(
-        "Move one or more emails between IMAP folders by email_id. Use list_emails_metadata and list_mailboxes "
-        "first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried."
+        "Move emails between IMAP folders using UIDs from list_emails_metadata in source_mailbox. "
+        "Specify exactly one of destination_mailbox or destination_role='junk' to discover the Junk folder "
+        "via \\Junk, then common names. Missing or ambiguous discovery requires an explicit destination; "
+        "no folder is created. To restore from Junk, list it again for current UIDs and move to INBOX with "
+        "that explicit source_mailbox. This requests a move, not guaranteed spam training or reporting. "
+        "Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1062,28 +1215,33 @@ async def move_emails(
         ),
     ],
     destination_mailbox: Annotated[
-        str,
+        str | None,
         Field(
             max_length=APPLICATION_LIMITS.mailbox_bytes,
-            description="The destination mailbox/folder to move emails to.",
+            description="Exact destination mailbox. Omit only when destination_role='junk' is supplied.",
         ),
-    ],
+    ] = None,
     source_mailbox: Annotated[
         str,
         Field(
             default="INBOX",
             max_length=APPLICATION_LIMITS.mailbox_bytes,
-            description="The source mailbox containing the emails.",
+            description="Mailbox in which email_ids were listed; UIDs are not transferable across mailboxes.",
         ),
     ] = "INBOX",
+    destination_role: Annotated[
+        Literal["junk"] | None,
+        Field(description="Discover the Junk destination. Mutually exclusive with destination_mailbox."),
+    ] = None,
 ) -> str:
     outcome = await move_emails_command(
-        MoveCommand(account_name, tuple(email_ids), source_mailbox, destination_mailbox)
+        MoveCommand(account_name, tuple(email_ids), source_mailbox, destination_mailbox, destination_role)
     )
-    succeeded = outcome.targets("succeeded")
-    if len(succeeded) == len(email_ids) and not outcome.reconciliation_needed:
-        return f"Successfully moved {len(succeeded)} email(s) to {destination_mailbox}"
-    return f"Move result [{_tagged_batch_result(outcome)}]"
+    succeeded = outcome.batch.targets("succeeded")
+    if len(succeeded) == len(email_ids) and not outcome.batch.reconciliation_needed:
+        return f"Successfully moved {len(succeeded)} email(s) to {outcome.destination_mailbox}"
+    placement = f"; mailbox: {outcome.destination_mailbox}" if destination_role is not None else ""
+    return f"Move result [{_tagged_batch_result(outcome.batch)}{placement}]"
 
 
 @mcp.tool(
@@ -1148,6 +1306,34 @@ async def list_mailboxes(
 ) -> list[MailboxInfo]:
     return await list_mailboxes_query(
         ListMailboxesQuery(account_name=account_name, pattern=pattern, reference=reference)
+    )
+
+
+@mcp.tool(
+    description="Create one mailbox/folder by its exact server name, including the hierarchy delimiter "
+    "reported by list_mailboxes (for example 'Archive/Projects' or 'INBOX.Projects'). Requires the "
+    "organize permission. Idempotent: an existing mailbox reports already_exists without changes. "
+    "Parent levels are created only if the server does so itself. An unknown status is not retried "
+    "automatically; verify with list_mailboxes.",
+    annotations=_IDEMPOTENT_REMOTE_MUTATION,
+)
+async def create_mailbox(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    mailbox: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="Exact mailbox name to create; must not contain the LIST wildcards '*' or '%' "
+            "or end with the server's hierarchy delimiter.",
+        ),
+    ],
+) -> CreateMailboxResult:
+    outcome = await create_mailbox_command(CreateMailboxCommand(account_name, mailbox))
+    return CreateMailboxResult(
+        mailbox=outcome.mailbox, status=outcome.status, reconciliation_needed=outcome.reconciliation_needed
     )
 
 
@@ -1257,4 +1443,30 @@ async def download_attachment(
             save_path=save_path,
             mailbox=mailbox,
         )
+    )
+
+
+@mcp.tool(
+    description=(
+        "Execute IMAP or SMTP primitives when a focused email tool does not cover the operation. "
+        "Existing tools, including create_mailbox, remain the simpler policy-aware route. "
+        'Start with commands=[{"command":"HELP"}] or HELP UID COPY for local syntax and examples; no account is needed for help. '
+        "Execution requires account_name and user-enabled allow_protocol_commands with compatible policy. "
+        "Commands run in order on one automatically authenticated connection; state lasts only for this call. "
+        "For example SELECT a mailbox, then UID COPY known UIDs to an existing destination. "
+        "Put APPEND/DATA message content in data, never in command lines. No login commands, passwords, hosts, "
+        "shell scripts or local paths. Stops on the first error. Inspect every result: prior effects may exist "
+        "and unknown completion must not be replayed automatically. HELP lists supported syntax; server "
+        "CAPABILITY alone does not imply client support for arbitrary extensions."
+    ),
+    annotations=_DESTRUCTIVE_REMOTE_MUTATION,
+)
+async def email_command(
+    commands: Annotated[list[ProtocolCommand], Field(min_length=1, max_length=20)],
+    account_name: str | None = None,
+    protocol: Literal["imap", "smtp"] = "imap",
+) -> CallToolResult:
+    """The MCP boundary bypasses SDK string coercion only for this tool."""
+    return await _execute_protocol_request(
+        ProtocolRequest(account_name=account_name, protocol=protocol, commands=commands)
     )

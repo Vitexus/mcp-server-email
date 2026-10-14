@@ -9,11 +9,34 @@ An email MCP server can read private messages, modify mailboxes, send messages,
 and access local files. Review the controls on this page before exposing it to
 an MCP client or network.
 
+## Advanced protocol command authority
+
+`email_command` is a deliberately broad, per-account opt-in, disabled by default.
+It is not implied by mutation grants and cannot be enabled through MCP. IMAP
+requires organize/delete/append, no sender filter and attachment-content access;
+SMTP requires send permission and explicit `*` recipient access. Incompatible
+policy fails closed rather than silently bypassing a sender/recipient filter.
+
+Enabling it permits server-authorized mailbox DELETE, broad EXPUNGE/CLOSE and
+arbitrary protocol flags/keywords. Semantic tag mappings and focused-tool
+mailbox protections do not apply to this channel. Prefer focused tools whenever
+possible; they retain their existing protections. The protocol channel cannot
+choose another endpoint, access local files, execute programs or supply login
+credentials. The server authenticates only the selected role and rechecks current
+account identity and admission before each command and APPEND/DATA payload.
+
+Each call has a dedicated bounded connection. There is no retry, compensation or
+implicit cleanup expunge. A timeout/disconnect after transmission may leave an
+unknown outcome; do not replay automatically. Responses and mail are untrusted
+content, not instructions. See [configuration](configuration.md#advanced-protocol-access)
+and [tool semantics](tools.md#email_command-advanced-protocol-operations).
+
 ## Local management UI security
 
 `mcp-email-server ui` is a foreground, single-user local adapter. It binds
 exactly to IPv4 `127.0.0.1`; port `0` is the default and selects an ephemeral
-port. The command exposes no host, wildcard, share, daemon, debug, reload, CORS,
+port. On Windows the listener claims its port exclusively, so another local
+socket cannot bind the same address and receive UI connections. The command exposes no host, wildcard, share, daemon, debug, reload, CORS,
 or remote mode. Its process-unique route serves only packaged same-origin React
 assets and explicit management use cases. There is no provider-connectivity
 control or route, mail, arbitrary file, generic RPC, OpenAPI, metrics, or
@@ -114,12 +137,17 @@ backups include plaintext `managed_secret.secret_value` values. Keep every copy
 under protection equivalent to the private original; do not upload, share, or
 treat it as a non-secret account database.
 
-The declared v3-to-v4 catalog migration runs only after the existing catalog and
-sidecars pass the same private-file checks as a normal managed open. One bounded
-SQLite write transaction validates the exact v3 schema, adds default-disabled
-attachment content and empty tag mappings, validates the resulting v4 schema and
-invariants, and records version 4 last. It neither selects nor copies secret
-values; failure rolls back without changing the advertised schema version.
+The declared v3/v4/v5-to-v6 catalog migration runs only after the existing catalog
+and sidecars pass the same private-file checks as a normal managed open. One
+bounded SQLite write transaction validates the exact source schema and adds
+default-disabled protocol access. Sources before v5 also receive fixed-five global
+grants, inheriting account overrides, and an unset draft mailbox; v3 additionally
+receives default-disabled attachment content and empty tag mappings. It validates
+the resulting v6 schema and invariants and records version 6 last. It neither
+resolves nor copies secret values; failure rolls back without changing the
+advertised source version. Older runtimes reject v6. Stop all catalog users and
+retain a private, consistent backup before the first new-version open; see
+[managed catalog upgrades](configuration.md#upgrading-a-managed-catalog-to-v6).
 
 A create or rotation stores a new immutable value and commits it as active only
 if the reviewed account revision still matches. On Linux and Windows, inserting
@@ -534,9 +562,39 @@ empty result means sending is disabled; it never means unrestricted sending.
 The Web UI edits recipients as individual add/edit/remove items and states this
 empty behavior explicitly. The restriction applies equally in managed and
 legacy mode and covers To, CC, and BCC. An initially empty policy is rejected
-before a provider is opened, including before a forward source is read.
+before a provider is opened for recipient-bearing compose, including before a
+forward source is read. A recipientless `save_draft` is the explicit exception
+described below.
 Clearing the last recipient does not enable unrestricted sending. This policy
 is not a read-only mode: other mailbox mutations remain available.
+
+### Mutation grants and read-only accounts
+
+Mail writes require an effective `allowed_mutations` class independently of
+recipient/sender restrictions. Omitted global fields retain all five classes
+(`draft`, `organize`, `delete`, `send`, `append`) for both new and old settings;
+there is no deny-by-default conversion. An omitted/null account override inherits;
+an explicit list replaces the global list. Set `[]` explicitly for read-only.
+See [configuration](configuration.md#mail-mutation-permissions) and the
+[effect mapping](tools.md#mail-mutation-permissions).
+
+Effective permissions and account authority are checked freshly at independent
+effect boundaries. Revoking `send` after SMTP acceptance prevents a subsequent
+Sent copy but never erases delivery success or causes resubmission. `send`
+authorizes only that successful message's Sent copy, not general APPEND.
+`organize` cannot expunge unrelated deleted messages. `draft` authorizes only
+`save_draft` with a configured or unique special-use draft destination and fixed
+`\Draft` flag; the caller cannot choose a mailbox or flags. No mailbox is
+created or guessed by these workflows; mailbox creation happens only through the
+explicit `create_mailbox` tool under `organize`. These restrictions need no approval tokens or extra ledger.
+
+A recipientless `save_draft` is valid even with an empty recipient allowlist.
+Every supplied To/CC/BCC address still requires a match before attachments are
+read or the message is appended. This exception does not allow recipientless
+SMTP submission or unrestricted `save_to_mailbox`. Read-only grants block
+implicit mark-read too; read without marking instead. Sender constraints,
+attachment protections, and provider capabilities remain unchanged. Permissions
+do not hide tools from the static MCP catalog.
 
 ### Recipient policy upgrade note
 
@@ -688,7 +746,11 @@ execute.
 The separate `attachments` parameter on `send_email` and `save_to_mailbox`
 reads local file paths. Relative paths are likewise resolved against the server
 process's working directory. Only connect clients that should be trusted to
-request access to files visible to that process.
+request access to files visible to that process. Requests rejected by account,
+send-capability (for `send_email`), or recipient-allowlist checks never open,
+stat, or resolve caller-supplied attachment paths, including UNC or network
+paths. Once those checks pass, attachment size or file-access validation may
+still reject the request after filesystem access.
 
 ## TLS certificate verification
 

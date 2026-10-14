@@ -52,6 +52,7 @@ from mcp_email_server.application.mutations import (
     BatchMutationOutcome,
     DeliveryMutationOutcome,
     FlagOperation,
+    MailboxCreationStatus,
     MutableEmailFlag,
     MutationStatus,
     SentCopyMutationOutcome,
@@ -60,7 +61,7 @@ from mcp_email_server.application.mutations import (
     validate_mailbox_name,
 )
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
-from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails import EmailHandler, charsets
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -70,6 +71,9 @@ from mcp_email_server.emails.models import (
     MailboxInfo,
 )
 from mcp_email_server.log import logger
+
+# GB2312 labels decode as GB18030, including in encoded-word headers (see charsets).
+charsets.install_gb2312_superset_aliases()
 
 # Maximum body length before truncation (characters)
 MAX_BODY_LENGTH = 20000
@@ -364,6 +368,7 @@ _IMAP_CAPABILITY_TIMEOUT_SECONDS = 30.0
 
 # Common Archive folder names, used as a fallback when no RFC 6154 \Archive flag is found.
 _ARCHIVE_FOLDER_CANDIDATES = ("Archive", "Archives", "[Gmail]/All Mail")
+_JUNK_FOLDER_CANDIDATES = ("Junk", "Spam", "[Gmail]/Spam", "Junk E-mail", "Junk Email")
 
 
 # RFC 3501 atoms exclude controls and these protocol-special characters.
@@ -718,6 +723,16 @@ def _imap_effect_status(response: Any) -> MutationStatus:
     if status in {"NO", "BAD"}:
         return "failed"
     return "unknown"
+
+
+def _has_already_exists_code(response: Any) -> bool:
+    """Detect the RFC 5530 ALREADYEXISTS response code without exposing server text."""
+    lines = response[1] if isinstance(response, tuple | list) and len(response) > 1 else getattr(response, "lines", ())
+    for line in lines or ():
+        text = line.decode("utf-8", "replace") if isinstance(line, bytes | bytearray) else str(line)
+        if text.lstrip().upper().startswith("[ALREADYEXISTS]"):
+            return True
+    return False
 
 
 async def _best_effort_imap_logout(imap: Any) -> None:
@@ -1180,6 +1195,7 @@ class EmailClient:
         sender_name: str | None = None,
         sender_address: str | None = None,
     ):
+        self.mutation_guard: Callable[[], None] | None = None
         self.email_server = email_server
         raw_sender = sender or email_server.user_name
         if sender_name is not None and sender_address is not None:
@@ -1207,6 +1223,10 @@ class EmailClient:
         self.smtp_use_tls = self.email_server.use_ssl
         self.smtp_start_tls = self.email_server.start_ssl
         self.smtp_verify_ssl = self.email_server.verify_ssl
+
+    def _check_mutation_authority(self) -> None:
+        if self.mutation_guard is not None:
+            self.mutation_guard()
 
     @property
     def envelope_sender(self) -> str:
@@ -1354,17 +1374,47 @@ class EmailClient:
             return
         yield part, False
 
+    def _find_attachment_part(self, message: Message, name: str) -> Message | None:
+        """Match listed attachment roots, preferring exact names over NFC aliases."""
+        normalized_name = self._normalize_attachment_name(name)
+        fallback = None
+        for part, is_attachment in self._iter_content_parts(message):
+            if not is_attachment:
+                continue
+            filename = part.get_filename()
+            if not isinstance(filename, str) or not filename:
+                continue
+            if filename == name:
+                return part
+            if fallback is None and self._normalize_attachment_name(filename) == normalized_name:
+                fallback = part
+        return fallback
+
+    @staticmethod
+    def _attachment_content(part: Message) -> bytes | None:
+        """Decode leaves or serialize a structured attachment as a usable MIME file.
+
+        Encapsulated messages export the inner message, without the attachment
+        wrapper. Multipart attachments need their own content headers and boundary
+        to remain parseable. Structured exports use CRLF and may normalize MIME
+        serialization; ordinary leaf payloads retain their exact decoded bytes.
+        """
+        if part.get_content_type() == "message/rfc822":
+            payload = part.get_payload()
+            if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], Message):
+                return payload[0].as_bytes(policy=SMTP_POLICY.clone(refold_source="none"))
+            return None
+        if part.get_content_maintype() == "multipart" and part.is_multipart():
+            return _strip_to_content_headers(part).as_bytes(policy=SMTP_POLICY.clone(refold_source="none"))
+        return _decoded_payload(part)
+
     @staticmethod
     def _decode_text_part(part: Message) -> str:
         """Decode a MIME text part without losing the message on a bad charset."""
         payload = _decoded_payload(part)
         if not payload:
             return ""
-        charset = part.get_content_charset("utf-8")
-        try:
-            return payload.decode(charset)
-        except (LookupError, UnicodeDecodeError):
-            return payload.decode("utf-8", errors="replace")
+        return charsets.decode_text(payload, part.get_content_charset("utf-8"))
 
     def _parse_email_data(  # noqa: C901
         self,
@@ -2227,7 +2277,7 @@ class EmailClient:
             except Exception:
                 logger.info("IMAP logout failed")
 
-    async def fetch_attachment(  # noqa: C901 - bounded MIME selection and provider cleanup
+    async def fetch_attachment(
         self,
         email_id: str,
         attachment_name: str,
@@ -2276,25 +2326,10 @@ class EmailClient:
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_email)
 
-            # Find the attachment
-            attachment_data: bytes | None = None
-            mime_type = None
-            normalized_attachment_name = self._normalize_attachment_name(attachment_name)
-
-            if email_message.is_multipart():
-                for part in email_message.walk():
-                    # Match attachments listed by ``_parse_email_data`` — this includes
-                    # inline-disposition parts with a filename (e.g. iOS Mail photos).
-                    if not self._is_attachment_part(part):
-                        continue
-                    filename = part.get_filename()
-                    if not isinstance(filename, str):
-                        continue
-                    if self._normalize_attachment_name(filename) == normalized_attachment_name:
-                        attachment_data = _decoded_payload(part)
-                        mime_type = part.get_content_type()
-                        break
-
+            # Use the same roots as the list, including single-part messages,
+            # without allowing a nested attachment to shadow a listed filename.
+            part = self._find_attachment_part(email_message, attachment_name)
+            attachment_data = self._attachment_content(part) if part is not None else None
             if attachment_data is None:
                 msg = f"Attachment '{attachment_name}' not found in email {email_id}"
                 logger.error(msg)
@@ -2303,7 +2338,7 @@ class EmailClient:
             return {
                 "email_id": email_id,
                 "attachment_name": attachment_name,
-                "mime_type": mime_type or "application/octet-stream",
+                "mime_type": part.get_content_type() if part is not None else "application/octet-stream",
                 "content": attachment_data,
             }
 
@@ -2788,6 +2823,14 @@ class EmailClient:
             if not accepted_indexes:
                 return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
 
+            try:
+                self._check_mutation_authority()
+            except PermissionError:
+                for accepted_index in accepted_indexes:
+                    outcomes[accepted_index] = TargetMutationOutcome(
+                        all_recipients[accepted_index], "failed", "mutation-policy"
+                    )
+                return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
             accepted_status: MutationStatus
             try:
                 await smtp.data(message_bytes)
@@ -3043,6 +3086,10 @@ class EmailClient:
                 if _imap_status(select_result) != "OK":
                     continue
                 try:
+                    self._check_mutation_authority()
+                except PermissionError:
+                    return SentCopyMutationOutcome("failed", folder, "mutation-policy")
+                try:
                     append_result = await _append_message(
                         imap,
                         msg,
@@ -3096,6 +3143,7 @@ class EmailClient:
             select_result = await imap.select(_quote_mailbox(mailbox, utf8=append_mode.session_utf8_enabled))
             if _imap_status(select_result) != "OK":
                 return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="mailbox-unavailable")
+            self._check_mutation_authority()
             try:
                 append_result = await _append_message(
                     imap,
@@ -3234,7 +3282,11 @@ class EmailClient:
                 store_cancelled = False
                 for index, email_id in enumerate(permitted):
                     try:
+                        self._check_mutation_authority()
                         response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                        continue
                     except asyncio.CancelledError:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "store-unknown")
                         for remaining_id in permitted[index + 1 :]:
@@ -3258,7 +3310,11 @@ class EmailClient:
                 if pending_expunge and not store_cancelled:
                     expunge_detail = "expunge-unknown"
                     try:
+                        self._check_mutation_authority()
                         response = await imap.uid("expunge", ",".join(pending_expunge))
+                    except PermissionError:
+                        response = None
+                        expunge_detail = "mutation-policy-cleanup-pending"
                     except asyncio.CancelledError:
                         response = None
                     except Exception:
@@ -3307,7 +3363,11 @@ class EmailClient:
                     )
                     continue
                 try:
+                    self._check_mutation_authority()
                     response = await imap.uid("store", email_id, store_operation, formatted_flags)
+                except PermissionError:
+                    outcomes.append(TargetMutationOutcome(email_id, "failed", "mutation-policy"))
+                    continue
                 except asyncio.CancelledError:
                     outcomes.append(TargetMutationOutcome(email_id, "unknown", "store-unknown"))
                     for remaining_id in email_ids[index + 1 :]:
@@ -3383,6 +3443,7 @@ class EmailClient:
                     )
                     continue
                 try:
+                    self._check_mutation_authority()
                     response = await imap.uid("store", email_id, store_operation, formatted_tags)
                     status = _imap_effect_status(response)
                     outcomes.append(
@@ -3410,6 +3471,8 @@ class EmailClient:
                         else:
                             outcomes.append(TargetMutationOutcome(remaining_id, "failed", "not-attempted"))
                     break
+                except PermissionError:
+                    outcomes.append(TargetMutationOutcome(email_id, "failed", "mutation-policy"))
                 except Exception:
                     outcomes.append(TargetMutationOutcome(email_id, "unknown", "tag-store-unknown"))
         finally:
@@ -3469,7 +3532,11 @@ class EmailClient:
             elif has_move:
                 for index, email_id in enumerate(permitted):
                     try:
+                        self._check_mutation_authority()
                         response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                        continue
                     except asyncio.CancelledError:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "move-unknown")
                         for remaining_id in permitted[index + 1 :]:
@@ -3493,7 +3560,11 @@ class EmailClient:
                 stopped = False
                 for index, email_id in enumerate(permitted):
                     try:
+                        self._check_mutation_authority()
                         copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                        continue
                     except asyncio.CancelledError:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
                         for remaining_id in permitted[index + 1 :]:
@@ -3512,7 +3583,13 @@ class EmailClient:
                         )
                         continue
                     try:
+                        self._check_mutation_authority()
                         store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id, "unknown", "copy-succeeded-policy-cleanup-pending"
+                        )
+                        continue
                     except asyncio.CancelledError:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-succeeded-store-unknown")
                         for remaining_id in permitted[index + 1 :]:
@@ -3541,7 +3618,11 @@ class EmailClient:
                 elif pending_expunge:
                     expunge_detail = "expunge-after-copy-unknown"
                     try:
+                        self._check_mutation_authority()
                         expunge_response = await imap.uid("expunge", ",".join(pending_expunge))
+                    except PermissionError:
+                        expunge_response = None
+                        expunge_detail = "mutation-policy-cleanup-pending"
                     except asyncio.CancelledError:
                         expunge_response = None
                     except Exception:
@@ -3772,6 +3853,53 @@ class EmailClient:
                 logger.info("IMAP logout failed")
 
         return mailboxes
+
+    async def create_mailbox(self, mailbox: str) -> MailboxCreationStatus:
+        """Create one mailbox by exact name; report existence instead of failing.
+
+        The LIST existence check and CREATE share one session so the reported
+        status reflects a single provider view. Once CREATE may have reached the
+        server, interruption is ``unknown`` and is never replayed here.
+        """
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            quoted = _quote_mailbox(mailbox)
+            # An empty LIST pattern discovers the reference namespace's delimiter
+            # even when the requested mailbox does not exist (RFC 3501 6.3.8).
+            hierarchy = await imap.list(quoted, '""')  # pyright: ignore[reportArgumentType]
+            _raise_for_imap_error(hierarchy, "LIST mailbox hierarchy before CREATE")
+            roots = _parse_list_responses(hierarchy[1])
+            if len(roots) != 1:
+                raise RuntimeError("LIST mailbox hierarchy returned no unique delimiter")
+            delimiter = roots[0].delimiter
+            if delimiter and mailbox.endswith(delimiter):
+                raise ValueError("mailbox must not end with the server's hierarchy delimiter")
+            response = await imap.list('""', quoted)  # pyright: ignore[reportArgumentType]
+            _raise_for_imap_error(response, "LIST mailbox before CREATE")
+            for existing in _parse_list_responses(response[1]):
+                # \Noselect/\NonExistent entries are hierarchy placeholders, not
+                # mailboxes; CREATE is what turns them into real ones.
+                if any(flag.casefold() in (r"\noselect", r"\nonexistent") for flag in existing.flags):
+                    continue
+                if existing.name == mailbox or existing.name.casefold() == "inbox" == mailbox.casefold():
+                    return "already_exists"
+            self._check_mutation_authority()
+            try:
+                created = await imap.create(quoted)
+            except Exception:
+                return "unknown"
+            status = _imap_effect_status(created)
+            if status == "succeeded":
+                return "created"
+            if status == "failed":
+                if _has_already_exists_code(created):
+                    return "already_exists"
+                raise RuntimeError(f"CREATE mailbox failed ({_imap_status(created)})")
+            return "unknown"
+        finally:
+            await _best_effort_imap_logout(imap)
 
 
 class ClassicEmailHandler(EmailHandler):
@@ -4018,6 +4146,22 @@ class ClassicEmailHandler(EmailHandler):
             allowed_senders=settings.allowed_senders,
             report_blocked_mutations=settings.report_blocked_mutations,
         )
+
+    async def _find_junk_folder(self) -> str | None:
+        """Find one selectable Junk mailbox; never choose by LIST order."""
+        mailboxes = await self.incoming_client.list_mailboxes()
+        selectable = [
+            mailbox for mailbox in mailboxes if not any(flag.casefold() == r"\noselect" for flag in mailbox.flags)
+        ]
+        candidates = [
+            mailbox.name for mailbox in selectable if any(flag.casefold() == r"\junk" for flag in mailbox.flags)
+        ]
+        if not candidates:
+            common_names = {name.casefold() for name in _JUNK_FOLDER_CANDIDATES}
+            candidates = [mailbox.name for mailbox in selectable if mailbox.name.casefold() in common_names]
+        if len(candidates) > 1:
+            raise ValueError("Junk mailbox is ambiguous; use list_mailboxes and specify destination_mailbox")
+        return candidates[0] if candidates else None
 
     async def _find_archive_folder(self) -> str | None:
         """Locate the Archive folder via the RFC 6154 ``\\Archive`` flag, then common names."""
