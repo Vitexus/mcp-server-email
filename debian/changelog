@@ -1,3 +1,13 @@
+mcp-server-email (1.13.1-1) unstable; urgency=medium
+
+  * New upstream version 1.13.1
+  * Attachment fixes: get_attachment_content and download_attachment
+    for single-part messages, nested files no longer shadow outer
+    attachments, .eml/.mhtml export with retained MIME structure
+
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Wed, 14 Oct 2026 17:41:51 +0200
+
 mcp-server-email (1.1.2-2) unstable; urgency=medium
 
   * Refresh 0001-mcp-sdk-2.0-compat.patch: it no longer applied to the
