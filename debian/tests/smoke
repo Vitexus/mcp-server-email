@@ -5,3 +5,26 @@
 # makes the server crash on import and fails this probe (non-zero exit).
 set -e
 mcprack server probe /usr/bin/mcp-server-email stdio
+
+# Real tools/call round-trip: tools/list alone missed a call_tool() signature
+# mismatch against python3-mcp 2.x (every call failed). list_available_accounts
+# needs no mail server connection.
+python3 - <<'PY'
+import asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+async def main() -> None:
+    params = StdioServerParameters(command="/usr/bin/mcp-server-email", args=["stdio"])
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("list_available_accounts", {})
+            if result.is_error:
+                raise SystemExit(f"tools/call failed: {result.content}")
+            print("tools/call list_available_accounts: OK")
+
+
+asyncio.run(main())
+PY

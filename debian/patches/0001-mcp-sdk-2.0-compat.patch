@@ -5,6 +5,9 @@ Description: Port from MCP SDK 1.x to 2.0.0
   * mcp.server.fastmcp.FastMCP -> mcp.server.mcpserver.MCPServer, whose
     constructor now takes version= directly (the private _mcp_server
     attribute this code used to set the version on is gone).
+  * MCPServer.call_tool() takes a third `context` argument that the
+    tools/call handler passes positionally; EmailMCP.call_tool() overrides
+    it and must accept and forward it, otherwise every tool call fails.
   * The private low-level Server handle moved from server._mcp_server to
     server._lowlevel_server (same .run()/.create_initialization_options()
     API, just renamed).
@@ -21,13 +24,12 @@ Description: Port from MCP SDK 1.x to 2.0.0
  and the Streamable HTTP transport answers initialize on /mcp.
 Author: Vítězslav Dvořák <info@vitexsoftware.cz>
 Forwarded: not-needed
-Last-Update: 2026-10-16
+Last-Update: 2026-11-22
 
 diff --git a/mcp_email_server/app.py b/mcp_email_server/app.py
-index d24c5e4..d042464 100644
 --- a/mcp_email_server/app.py
 +++ b/mcp_email_server/app.py
-@@ -7,7 +7,7 @@ from importlib.metadata import version
+@@ -7,7 +7,7 @@
  from typing import Annotated, Any, Literal
  
  import anyio
@@ -36,7 +38,7 @@ index d24c5e4..d042464 100644
  from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent, ToolAnnotations
  from pydantic import Field, ValidationError
  
-@@ -287,8 +287,8 @@ class EmailMCP(FastMCP):
+@@ -287,13 +287,13 @@
          tools = await super().list_tools()
          for tool in tools:
              if tool.name == "email_command":
@@ -46,8 +48,15 @@ index d24c5e4..d042464 100644
 +                tool.output_schema = ProtocolResult.model_json_schema()
          return tools
  
-     async def call_tool(self, name: str, arguments: dict[str, Any]):  # pyright: ignore[reportIncompatibleMethodOverride] - MCP supports CallToolResult, SDK annotation omits it
-@@ -306,9 +306,7 @@ class EmailMCP(FastMCP):
+-    async def call_tool(self, name: str, arguments: dict[str, Any]):  # pyright: ignore[reportIncompatibleMethodOverride] - MCP supports CallToolResult, SDK annotation omits it
++    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None):  # pyright: ignore[reportIncompatibleMethodOverride] - MCP supports CallToolResult, SDK annotation omits it
+         if name != "email_command":
+-            return await super().call_tool(name, arguments)
++            return await super().call_tool(name, arguments, context)
+         try:
+             request = ProtocolRequest.model_validate(arguments)
+         except ValidationError:
+@@ -306,9 +306,7 @@
          return await _execute_protocol_request(request)
  
  
@@ -59,10 +68,9 @@ index d24c5e4..d042464 100644
  _READ_ONLY_LOCAL = ToolAnnotations(
      readOnlyHint=True,
 diff --git a/mcp_email_server/cli.py b/mcp_email_server/cli.py
-index b38e19a..e3eb3da 100644
 --- a/mcp_email_server/cli.py
 +++ b/mcp_email_server/cli.py
-@@ -178,10 +178,12 @@ def _build_transport_security_settings(host: str, port: int) -> TransportSecurit
+@@ -178,10 +178,12 @@
      )
  
  
@@ -79,7 +87,7 @@ index b38e19a..e3eb3da 100644
  
  
  def _json_requested() -> bool:
-@@ -1338,8 +1340,7 @@ def sse(
+@@ -1338,8 +1340,7 @@
  ) -> None:
      """Run the compatibility SSE transport with explicit HTTP trust boundaries."""
      _validate_managed_runtime()
@@ -89,7 +97,7 @@ index b38e19a..e3eb3da 100644
  
  
  @app.command()
-@@ -1355,8 +1356,7 @@ def streamable_http(
+@@ -1355,8 +1356,7 @@
  ) -> None:
      """Run the compatibility Streamable HTTP transport with explicit trust boundaries."""
      _validate_managed_runtime()
@@ -100,10 +108,9 @@ index b38e19a..e3eb3da 100644
  
  @app.command()
 diff --git a/mcp_email_server/stdio.py b/mcp_email_server/stdio.py
-index dd5a9cf..027e6d3 100644
 --- a/mcp_email_server/stdio.py
 +++ b/mcp_email_server/stdio.py
-@@ -13,7 +13,7 @@ import anyio
+@@ -13,7 +13,7 @@
  from anyio.abc import ObjectReceiveStream, ObjectSendStream
  from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
  from mcp import types
@@ -112,7 +119,7 @@ index dd5a9cf..027e6d3 100644
  from mcp.shared.message import SessionMessage
  
  from mcp_email_server.application.limits import APPLICATION_LIMITS
-@@ -123,7 +123,7 @@ async def _stdin_reader(
+@@ -123,7 +123,7 @@
                      raise TypeError("Bounded stdio reader returned an invalid frame type")
                  try:
                      text = raw.decode("utf-8", errors="strict")
@@ -121,7 +128,7 @@ index dd5a9cf..027e6d3 100644
                  except (UnicodeDecodeError, ValueError):
                      await send_stream.send(ValueError("Invalid or oversized JSON-RPC frame"))
                      continue
-@@ -167,10 +167,10 @@ async def _run_server(
+@@ -167,10 +167,10 @@
  ) -> None:
      try:
          async with read_stream, write_stream:
