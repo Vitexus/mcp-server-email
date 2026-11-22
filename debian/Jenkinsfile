@@ -91,7 +91,9 @@ stage('Checkout ' + distroName) {
                     buildImage.inside {
                         // Git operations run inside the container to avoid index.lock conflicts
                         // when multiple parallel branches share the same Jenkins agent node.
-                        sh 'git checkout debian/changelog'
+                        // The workspace is rebuilt from a stash, which carries no .git directory,
+                        // so this is a no-op there; never fail the build on it.
+                        sh 'git checkout debian/changelog 2>/dev/null || true'
                         def version = sh(
                             script: 'dpkg-parsechangelog --show-field Version',
                             returnStdout: true
